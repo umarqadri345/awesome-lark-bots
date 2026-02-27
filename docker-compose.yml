@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  brainstorm:
+    build: .
+    command: python3 -m brainstorm
+    env_file: .env
+    restart: always
+    volumes:
+      - ./runs:/app/runs
+
+  planner:
+    build: .
+    command: python3 -m planner
+    env_file: .env
+    restart: always
+    volumes:
+      - ./runs:/app/runs
+
+  assistant:
+    build: .
+    command: python3 -m assistant
+    env_file: .env
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - ./runs:/app/runs
+
+  creative:
+    build: .
+    command: python3 -m creative
+    env_file: .env
+    restart: always
+
+  sentiment:
+    build: .
+    command: python3 -m sentiment
+    env_file: .env
+    restart: always
+    volumes:
+      - ./data:/app/data
