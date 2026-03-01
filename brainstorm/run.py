@@ -41,16 +41,19 @@ from core.llm import chat_completion, get_model_for_role
 from core.utils import load_context, run_timestamp, save_session, truncate_for_display
 from skills import load_context as load_skill_context
 
-def _send_brainstorm_card(title: str, content: str, color: str = "blue") -> bool:
-    # 被自媒体助手调用时，优先用自媒体助手指定的脑暴推送 webhook
-    webhook = (_os.environ.get("CONDUCTOR_BRAINSTORM_WEBHOOK") or _os.environ.get("FEISHU_WEBHOOK") or "").strip()
+def _send_brainstorm_card(title: str, content: str, color: str = "blue", webhook_override: str | None = None) -> bool:
+    # 优先使用调用方传入的 webhook（脑暴机器人 vs 自媒体助手 分群推送）
+    if webhook_override:
+        webhook = webhook_override.strip()
+    else:
+        webhook = (_os.environ.get("CONDUCTOR_BRAINSTORM_WEBHOOK") or _os.environ.get("FEISHU_WEBHOOK") or "").strip()
     if not webhook:
         return False
     secret = (_os.environ.get("FEISHU_SECRET") or "").strip()
     return _send_card(title, content, webhook, secret=secret, color=color)
 
 
-REFINE_SYSTEM = """You are a Creative Strategy Architect.
+REFINE_SYSTEM_CAMPAIGN = """You are a Creative Strategy Architect.
 
 Your task is to clarify and structure the user's raw topic into a Brainstorm Seed. Stay close to the user's original topic: do not over-interpret, over-expand, or replace it with a different brief. Preserve the core intent and wording; only add structure and clarity. Do not add assumptions or objectives the user did not imply.
 
@@ -127,7 +130,161 @@ Do not over-interpret: if the topic is narrow, keep the seed narrow. If the topi
 Only output the structured content; do not explain your reasoning."""
 
 
-def refine_brainstorm_topic_deepseek(topic: str, context: str) -> str:
+REFINE_SYSTEM_PROJECT = """You are a Creative Strategy Architect for product and project brainstorming.
+
+Your task is to clarify and structure the user's raw topic into a Brainstorm Seed. Stay close to the user's original topic: do not over-interpret, over-expand, or replace it with a different brief.
+
+You must output in the following structure:
+
+---
+
+INSIGHT LAYER
+
+User Insight:
+(what the creator wants to achieve or explore; concise)
+
+Project Insight:
+(nature of project, current stage, technical/resource constraints; concise)
+
+---
+
+#brainstorm
+
+原始主题：
+(Copy the user's raw topic verbatim, character for character.)
+
+Theme:
+(reframe only slightly; stay aligned with original topic)
+
+Background:
+(brief, from materials)
+
+Core Challenge:
+(the real difficulty implied by the topic)
+
+Constraints:
+(realistic; from topic/materials)
+
+Core Goal:
+(one clear goal for this project; do not broaden scope)
+
+Target User:
+(who benefits from this; what they currently lack)
+
+Key Design Tension:
+(the core tradeoff or dilemma the project must resolve)
+
+Core Task:
+
+Design the Core Experience:
+
+User【does what action】
+User【feels what】
+User【then does what as a result】
+
+---
+
+Requirements:
+
+Total length: under 500 words. All output in Chinese (中文). Plain text only, no asterisks.
+Do not over-interpret. Only output the structured content; do not explain your reasoning."""
+
+
+REFINE_SYSTEM_EXPLORE = """You are a Creative Strategy Architect for life and personal brainstorming.
+
+Your task is to clarify and structure the user's raw topic into a Brainstorm Seed. Stay close to the user's original topic: do not over-interpret, over-expand, or replace it with a different brief.
+
+You must output in the following structure:
+
+---
+
+INSIGHT LAYER
+
+User Insight:
+(what the person actually wants — not just what they said; concise)
+
+Situation Insight:
+(current state, real constraints, what has been tried or assumed; concise)
+
+---
+
+#brainstorm
+
+原始主题：
+(Copy the user's raw topic verbatim, character for character.)
+
+Theme:
+(reframe only slightly; stay aligned with original topic)
+
+Background:
+(brief, from materials or implied context)
+
+Core Challenge:
+(the real difficulty — often not what the person thinks it is)
+
+Constraints:
+(time, resources, personality, situation; realistic)
+
+Goal:
+(one clear outcome to brainstorm toward; do not broaden scope)
+
+Hidden Assumption:
+(what the person might be taking for granted that could be wrong)
+
+Core Task:
+
+Design the Core Action:
+
+When【trigger or opportunity arises】
+Person【does what specific action】
+Person【gets what result or feeling】
+
+---
+
+Requirements:
+
+Total length: under 500 words. All output in Chinese (中文). Plain text only, no asterisks.
+Do not over-interpret. Only output the structured content; do not explain your reasoning."""
+
+
+# ── 话题类型检测 ──────────────────────────────────────────────
+
+_CAMPAIGN_SIGNALS = (
+    "营销", "推广", "活动", "传播", "品牌", "campaign", "launch",
+    "内容策略", "社媒", "线下活动", "联动", "合作", "种草",
+    "周年", "发布", "曝光", "宣传", "事件营销", "快闪",
+    "小红书", "抖音", "B站", "微博", "快手",
+)
+
+_PROJECT_SIGNALS = (
+    "设计", "开发", "产品", "功能", "系统", "工具", "app", "游戏",
+    "模拟器", "bot", "机器人", "架构", "原型", "MVP",
+    "project", "side project", "对话系统", "玩法", "机制",
+)
+
+
+def _detect_topic_type(topic: str, context: str = "") -> str:
+    """从话题内容推断脑暴类型：campaign / project / explore"""
+    combined = f"{topic} {context}".lower()
+    campaign_score = sum(1 for s in _CAMPAIGN_SIGNALS if s.lower() in combined)
+    project_score = sum(1 for s in _PROJECT_SIGNALS if s.lower() in combined)
+    if campaign_score >= project_score and campaign_score > 0:
+        return "campaign"
+    if project_score > 0:
+        return "project"
+    return "explore"
+
+
+_REFINE_SYSTEMS = {
+    "campaign": REFINE_SYSTEM_CAMPAIGN,
+    "project": REFINE_SYSTEM_PROJECT,
+    "explore": REFINE_SYSTEM_EXPLORE,
+}
+
+REFINE_SYSTEM = REFINE_SYSTEM_CAMPAIGN
+
+
+def refine_brainstorm_topic_deepseek(topic: str, context: str, topic_type: str = "campaign") -> str:
     user = f"""Input: Raw brainstorming topic and background materials below.
 
 Output: First the INSIGHT LAYER (concise), then the Brainstorm Seed. In the #brainstorm section you must include "原始主题：" and copy the raw topic below verbatim (一字不改). Stay close to the user's topic; do not over-interpret or add objectives they did not imply. All content in Chinese (中文). No asterisks; plain text only.
@@ -139,9 +296,10 @@ Raw topic:
 
 Background materials:
 {context[:8000] if len(context) > 8000 else context}"""
+    refine_sys = _REFINE_SYSTEMS.get(topic_type, REFINE_SYSTEM_CAMPAIGN)
     try:
         from core.skill_router import enrich_prompt
-        sys = enrich_prompt(REFINE_SYSTEM, user_text=user, bot_type="brainstorm")
+        sys = enrich_prompt(refine_sys, user_text=user, bot_type="brainstorm")
         return chat_completion(provider="deepseek", system=sys, user=user).strip()
     except Exception:
         return ""
@@ -277,6 +435,8 @@ def run_round(
     round_summaries: list[str],
     ts: str,
     brand_context: str = "",
+    webhook_override: str | None = None,
+    topic_type: str = "campaign",
 ) -> tuple[list[str], str]:
     ROLES, display_fn, round_names, round_goals, is_v3 = _get_roles_and_config()
     goal = round_goals.get(round_num, "")
@@ -297,11 +457,22 @@ def run_round(
         "禁止使用星号（* 或 **），禁止 markdown、bullet、编号列表。一律纯文本。不要咨询报告腔、不要企业黑话。"
         "每条最多 3～4 段短段，像真人打字，能一句话说清的不写长段。"
     )
-    if is_v3:
+
+    # ── 按话题类型适配讨论纪律 ──
+    if is_v3 and topic_type == "campaign":
         parts.append(
             "【节奏】讨论中大家要想清楚整个 campaign 的节奏：若是传播向，需明确预热、高潮、收尾；若是现场活动，需明确具体时长与体验节奏设置（例如几点到几点、每个环节多久、情绪曲线如何）。"
         )
-    if is_v3 and round_num == 3:
+    elif is_v3 and topic_type == "project":
+        parts.append(
+            "【节奏】这是产品/项目脑暴。聚焦用户体验和技术可行性。每个方向要说清楚：用户怎么用、核心体验是什么、技术上能不能做、和现有方案有什么不同。"
+        )
+    elif is_v3 and topic_type == "explore":
+        parts.append(
+            "【节奏】这是生活/个人话题脑暴。聚焦可执行性和个人契合度。每个方向要说清楚：具体怎么做、需要多少时间精力、适不适合这个人的性格和现状、最可能卡在哪。"
+        )
+
+    if is_v3 and round_num == 3 and topic_type == "campaign":
         parts.append(
             "【第三轮纪律——严格执行】\n"
             "1. 每位 agent 必须对上轮留下的每个方向逐一表态：「保留」或「淘汰」，附一句话理由。不允许含糊或跳过。\n"
@@ -310,13 +481,47 @@ def run_round(
             "4. 松子仁最后发言，做出不可翻转的最终裁决。只留 3 个方向，不妥协、不合并。\n"
             "5. 评价维度：行为改变、新颖性、传播动机。不按情绪基调或「听起来不错」来评价。"
         )
-    if is_v3 and round_num == 4:
+    elif is_v3 and round_num == 3 and topic_type == "project":
+        parts.append(
+            "【第三轮纪律——严格执行】\n"
+            "1. 每位 agent 必须对上轮留下的每个方向逐一表态：「保留」或「淘汰」，附一句话理由。\n"
+            "2. 禁止全票通过——至少一半方向必须被淘汰。\n"
+            "3. 三道筛子：体验完整性（用户的核心体验闭环能不能跑通？跑不通→淘汰）、技术可行性（以当前资源和能力能不能做出来？不能→淘汰）、差异化（和已有方案比有没有本质不同？没有→淘汰）。\n"
+            "4. 松子仁最后发言，做出不可翻转的最终裁决。只留 3 个方向，不妥协、不合并。\n"
+            "5. 评价维度：体验完整性、技术可行性、差异化。"
+        )
+    elif is_v3 and round_num == 3 and topic_type == "explore":
+        parts.append(
+            "【第三轮纪律——严格执行】\n"
+            "1. 每位 agent 必须对上轮留下的每个方向逐一表态：「保留」或「淘汰」，附一句话理由。\n"
+            "2. 禁止全票通过——至少一半方向必须被淘汰。\n"
+            "3. 三道筛子：可执行性（这个人真的能做到吗？考虑时间、性格、现状。做不到→淘汰）、个人契合度（做这件事会让ta更开心/更接近目标吗？不会→淘汰）、创新度（这个建议是不是ta早就想过的废话？是→淘汰）。\n"
+            "4. 松子仁最后发言，做出不可翻转的最终裁决。只留 3 个方向，不妥协、不合并。\n"
+            "5. 评价维度：可执行性、个人契合度、创新度。"
+        )
+
+    if is_v3 and round_num == 4 and topic_type == "campaign":
         parts.append(
             "【第四轮纪律——严格执行】\n"
             "本轮仅围绕第三轮松子仁裁决保留的 3 个方向展开。\n"
             "严禁复活已淘汰方向，严禁引入新方向。违反者由松子仁当场制止。\n"
             "所有讨论和产出必须聚焦于如何让这 3 个方向落地、传播、视觉化。"
         )
+    elif is_v3 and round_num == 4 and topic_type == "project":
+        parts.append(
+            "【第四轮纪律——严格执行】\n"
+            "本轮仅围绕第三轮松子仁裁决保留的 3 个方向展开。\n"
+            "严禁复活已淘汰方向，严禁引入新方向。\n"
+            "聚焦：每个方向的 MVP 怎么做、第一步是什么、需要什么资源、多久能验证。"
+        )
+    elif is_v3 and round_num == 4 and topic_type == "explore":
+        parts.append(
+            "【第四轮纪律——严格执行】\n"
+            "本轮仅围绕第三轮松子仁裁决保留的 3 个方向展开。\n"
+            "严禁复活已淘汰方向，严禁引入新方向。\n"
+            "聚焦：每个方向的具体行动计划——第一步做什么、什么时候做、怎么知道有没有效、卡住了怎么办。"
+        )
+
     if not is_v3:
         parts.append("【约束】方案需符合游戏调性与 IP，但优先做游戏外、社媒上、线下、现实场景的体验；这类体验由市场团队更可控、更好落地。")
     base_context = "\n\n".join(parts)
@@ -353,7 +558,7 @@ def run_round(
         round_label = f"第{round_num}轮 {round_name}" if is_v3 else f"Round {round_num}"
         card_title = f"{cn_name}（{cn_role}）| {round_label}"
         card_color = AGENT_COLORS.get(cn_name, ROUND_COLORS.get(round_num, "blue"))
-        _send_brainstorm_card(card_title, display, color=card_color)
+        _send_brainstorm_card(card_title, display, color=card_color, webhook_override=webhook_override)
         print(f"    [{idx}/{n_roles}] {cn_name}（{cn_role}）完成 ({len(display)} 字) 已推送到飞书", flush=True)
         time.sleep(FEISHU_INTERVAL)
 
@@ -387,21 +592,39 @@ def run_brainstorm(
     deliverables: str = "",
     no_refine: bool = False,
     brand: str = "",
+    webhook: str | None = None,
 ) -> str:
     """执行完整的脑暴流程，返回 session 文件路径。
 
+    webhook: 本场脑暴推送的飞书 webhook URL。由调用方传入以区分：
+      - 脑暴机器人发起：传 FEISHU_WEBHOOK（或 BRAINSTORM_FEISHU_WEBHOOK）
+      - 自媒体助手(conductor)发起：传 CONDUCTOR_BRAINSTORM_WEBHOOK
+    不传则回退到 FEISHU_WEBHOOK（CLI 等）。
+
     brand: 可选，指定品牌名。留空则自动从 topic/context 中检测。
     """
+    resolved_webhook = (webhook or "").strip() or (_os.environ.get("FEISHU_WEBHOOK") or "").strip() or None
+
+    topic_type = _detect_topic_type(topic, context)
+    _type_labels = {"campaign": "营销活动", "project": "创意项目", "explore": "通用探索"}
+    print(f"[话题类型] {_type_labels.get(topic_type, topic_type)}", flush=True)
+
     if not deliverables:
-        deliverables = "方案文档（md）、执行清单（md）、飞书群公告/brief（md）"
+        if topic_type == "campaign":
+            deliverables = "方案文档（md）、执行清单（md）、飞书群公告/brief（md）"
+        elif topic_type == "project":
+            deliverables = "方案文档（md）、MVP 定义、执行步骤"
+        else:
+            deliverables = "行动方案、具体步骤、检验标准"
 
     brand_context = ""
-    if brand:
-        brand_context = load_skill_context("brand", brand_name=brand)
-    else:
-        brand_context = load_skill_context("brand", detect_from=f"{topic} {context}")
-    if brand_context:
-        print(f"[品牌知识] 已加载品牌知识，将注入到讨论上下文中。", flush=True)
+    if topic_type in ("campaign", "project"):
+        if brand:
+            brand_context = load_skill_context("brand", brand_name=brand)
+        else:
+            brand_context = load_skill_context("brand", detect_from=f"{topic} {context}")
+        if brand_context:
+            print(f"[品牌知识] 已加载品牌知识，将注入到讨论上下文中。", flush=True)
 
     ts = run_timestamp()
     round_summaries: list[str] = []
@@ -415,7 +638,7 @@ def run_brainstorm(
 
     if not no_refine:
         print("[DeepSeek] 正在优化脑暴主题与讨论思路...", flush=True)
-        refined = refine_brainstorm_topic_deepseek(topic, context)
+        refined = refine_brainstorm_topic_deepseek(topic, context, topic_type=topic_type)
         if refined:
             topic = refined
             session_lines.append("DeepSeek 优化后的主题与思路：")
@@ -425,7 +648,7 @@ def run_brainstorm(
             session_lines.append("---")
             session_lines.append("")
             print("[DeepSeek] 已确定主题与思路。", flush=True)
-            _send_brainstorm_card("本场脑暴主题", truncate_for_display(refined), color="indigo")
+            _send_brainstorm_card("本场脑暴主题", truncate_for_display(refined), color="indigo", webhook_override=resolved_webhook)
             time.sleep(FEISHU_INTERVAL)
         else:
             print("[DeepSeek] 调用失败，使用原始主题。", flush=True)
@@ -452,12 +675,12 @@ def run_brainstorm(
             controller_msg = CONTROLLER_ANNOUNCE.get(round_num, f"进入第{round_num}轮")
             print(f"  [Controller] {controller_msg}", flush=True)
             round_color = ROUND_COLORS.get(round_num, "blue")
-            _send_brainstorm_card(f"第 {round_num} 轮：{round_name}", controller_msg, color=round_color)
+            _send_brainstorm_card(f"第 {round_num} 轮：{round_name}", controller_msg, color=round_color, webhook_override=resolved_webhook)
             session_lines.append("## " + controller_msg)
         else:
             header = f"Round {round_num} / {round_name} / 主题: {topic} / 目标与约束: {goal}"
             print(f"  [飞书] 发送本轮开场...", flush=True)
-            _send_brainstorm_card(f"Round {round_num}: {round_name}", header, color=ROUND_COLORS.get(round_num, "blue"))
+            _send_brainstorm_card(f"Round {round_num}: {round_name}", header, color=ROUND_COLORS.get(round_num, "blue"), webhook_override=resolved_webhook)
             session_lines.append("## " + header)
         session_lines.append("")
         time.sleep(FEISHU_INTERVAL)
@@ -467,6 +690,8 @@ def run_brainstorm(
             round_num=round_num, topic=topic, context=context,
             deliverables=deliverables, round_summaries=round_summaries, ts=ts,
             brand_context=brand_context,
+            webhook_override=resolved_webhook,
+            topic_type=topic_type,
         )
         round_summaries.append(round_summary)
 
@@ -485,22 +710,54 @@ def run_brainstorm(
         session_lines.append("")
 
     if is_v3 and round_summaries:
-        print("[最终交付] 由 Kimi 生成讨论总结 + Claude Code prompt、视觉大模型 prompt...", flush=True)
         summary_input = f"主题：{topic}\n\n各轮摘要：\n" + "\n\n".join(f"第{i}轮：{s}" for i, s in enumerate(round_summaries, 1))
-        final_system = (
-            "你是体验创新流程的交付整理员。根据以下四轮讨论摘要，输出两样内容，分开写、标题明确。全文必须使用中文。"
-            "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
-            "【交付一】讨论总结 + 供 Claude Code 完善成具体计划和工作流的 prompt\n"
-            "1. 讨论总结：先逐一列出四轮中讨论过的所有创意/方向（第一轮约 10 个、第二轮 6 个、第三轮留下 3 个），"
-            "再用 3～5 段自然段概括结论、共识与最终留下的 3 个体验方向。\n"
-            "2. Claude Code 用 prompt：写一段可直接复制给 Claude Code 的完整 prompt，说明请其根据上述讨论总结，"
-            "完善成具体执行计划和工作流（含步骤、负责人建议、产出物、验收标准、时间节点等），便于 Claude Code 据此输出可落地的计划与工作流。\n\n"
-            "【交付二】供视觉大模型生成的创意概念可视化的 prompt\n"
-            "为上述 3 个体验方向各写一份可直接交给图像/视频大模型使用的 prompt。每份须包含："
-            "（1）能够可视化的体验参考——场景、光线、氛围、关键瞬间、人物动作等，语言简洁、适合作生成模型输入；"
-            "须自动加入符合品牌调性的风格描述（如色彩、质感、情绪基调、视觉语言）。"
-            "（2）用户角度的创意脚本——从用户视角可被拍摄/讲述的脚本或梗概，须有传播力（易被转发、可引发共鸣或讨论、具备记忆点）。"
-        )
+
+        if topic_type == "campaign":
+            print("[最终交付] 由 Kimi 生成讨论总结 + Claude Code prompt、视觉大模型 prompt...", flush=True)
+            final_system = (
+                "你是体验创新流程的交付整理员。根据以下四轮讨论摘要，输出两样内容，分开写、标题明确。全文必须使用中文。"
+                "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
+                "【交付一】讨论总结 + 供 Claude Code 完善成具体计划和工作流的 prompt\n"
+                "1. 讨论总结：先逐一列出四轮中讨论过的所有创意/方向（第一轮约 10 个、第二轮 6 个、第三轮留下 3 个），"
+                "再用 3～5 段自然段概括结论、共识与最终留下的 3 个体验方向。\n"
+                "2. Claude Code 用 prompt：写一段可直接复制给 Claude Code 的完整 prompt，说明请其根据上述讨论总结，"
+                "完善成具体执行计划和工作流（含步骤、负责人建议、产出物、验收标准、时间节点等），便于 Claude Code 据此输出可落地的计划与工作流。\n\n"
+                "【交付二】供视觉大模型生成的创意概念可视化的 prompt\n"
+                "为上述 3 个体验方向各写一份可直接交给图像/视频大模型使用的 prompt。每份须包含："
+                "（1）能够可视化的体验参考——场景、光线、氛围、关键瞬间、人物动作等，语言简洁、适合作生成模型输入；"
+                "须自动加入符合品牌调性的风格描述（如色彩、质感、情绪基调、视觉语言）。"
+                "（2）用户角度的创意脚本——从用户视角可被拍摄/讲述的脚本或梗概，须有传播力（易被转发、可引发共鸣或讨论、具备记忆点）。"
+            )
+        elif topic_type == "project":
+            print("[最终交付] 由 Kimi 生成项目方案总结 + MVP 定义 + Claude Code prompt...", flush=True)
+            final_system = (
+                "你是产品/项目脑暴的交付整理员。根据以下四轮讨论摘要，输出两样内容，分开写、标题明确。全文必须使用中文。"
+                "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
+                "【交付一】讨论总结 + MVP 定义\n"
+                "1. 讨论总结：先列出各轮讨论过的所有方向，再概括最终留下的 3 个方向的核心思路。\n"
+                "2. 对每个方向给出 MVP 定义：核心功能是什么、第一个用户怎么用、最小需要做什么就能验证、预计多久能做出来。\n\n"
+                "【交付二】供 Claude Code 实现的 prompt\n"
+                "为最终留下的 3 个方向各写一段可直接复制给 Claude Code 的 prompt，说明：\n"
+                "- 要做什么（功能描述）\n"
+                "- 技术方案建议（语言、框架、架构）\n"
+                "- 第一步从哪开始\n"
+                "- 验收标准（怎么算做完了）"
+            )
+        else:
+            print("[最终交付] 由 Kimi 生成行动方案总结...", flush=True)
+            final_system = (
+                "你是生活/个人话题脑暴的交付整理员。根据以下四轮讨论摘要，输出内容。全文必须使用中文。"
+                "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
+                "【交付一】讨论总结\n"
+                "列出各轮讨论过的所有方向，概括最终留下的 3 个方向，说清楚每个方向的核心思路和为什么值得做。\n\n"
+                "【交付二】行动方案\n"
+                "为最终留下的 3 个方向各写一份可执行的行动计划：\n"
+                "- 第一步做什么（本周就能做的）\n"
+                "- 怎么知道有没有效（检验标准，不是感觉）\n"
+                "- 最可能卡住的地方 + 卡住了怎么办\n"
+                "- 时间线建议\n\n"
+                "最后给一个总结建议：如果只能选一个方向先试，选哪个、为什么。"
+            )
         try:
             final_output = chat_completion(provider="kimi", system=final_system, user=summary_input).strip()
             session_lines.append("## 最终交付（两样）")
@@ -508,7 +765,7 @@ def run_brainstorm(
             session_lines.append(final_output)
             session_lines.append("")
             to_feishu = final_output if len(final_output) <= 8000 else final_output[:8000] + "\n\n[内容过长，完整交付请查看 session 文件]"
-            _send_brainstorm_card("最终交付", to_feishu, color="green")
+            _send_brainstorm_card("最终交付", to_feishu, color="green", webhook_override=resolved_webhook)
             time.sleep(FEISHU_INTERVAL)
         except Exception as e:
             print(f"[最终交付] 生成失败: {e}", flush=True)
@@ -518,9 +775,9 @@ def run_brainstorm(
     print("[保存] 会话已写入 " + str(path), flush=True)
 
     if is_v3:
-        _send_brainstorm_card("脑暴结束", f"完整会话已保存至 `{path}`", color="green")
+        _send_brainstorm_card("脑暴结束", f"完整会话已保存至 `{path}`", color="green", webhook_override=resolved_webhook)
     else:
-        _send_brainstorm_card("脑暴结束", f"完整会话与 Handoff Pack 已保存至 `{path}`", color="green")
+        _send_brainstorm_card("脑暴结束", f"完整会话与 Handoff Pack 已保存至 `{path}`", color="green", webhook_override=resolved_webhook)
     print("\n========== 脑暴结束 ==========", flush=True)
     return str(path)
 

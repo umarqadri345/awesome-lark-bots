@@ -100,7 +100,7 @@ class CrossCulturalSkill(Skill):
         "localization", "韩国", "日本", "东南亚", "欧美",
         "cross-cultural", "cross-regional", "多语言",
     ]
-    bot_types = ["planner"]
+    bot_types = []
 
     def get_context(self, **kwargs) -> str:
         return _CROSS_CULTURAL.strip()

@@ -39,7 +39,7 @@ class MarketingSkill(Skill):
     name = "marketing"
     description = "营销技能知识库 — 提供营销方法论、策略框架、行业 SOP 等参考"
     trigger_keywords = ["营销", "推广", "marketing", "策略", "获客", "运营", "增长"]
-    bot_types = ["planner", "conductor"]
+    bot_types = ["conductor"]
 
     def __init__(self, modules_dir: Optional[Path] = None):
         self.modules_dir = modules_dir or MODULES_DIR

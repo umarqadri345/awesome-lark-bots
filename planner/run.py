@@ -45,13 +45,24 @@ FEISHU_INTERVAL = 1.0
 PROVIDER = "deepseek"
 
 
-def _load_skills_context() -> str:
-    """通过共享技能库加载营销知识摘要，为规划提供领域知识参考。"""
+_MARKETING_SIGNALS = (
+    "营销", "推广", "增长", "获客", "品牌", "内容", "运营", "投放",
+    "小红书", "抖音", "B站", "微博", "快手", "平台", "社媒",
+    "marketing", "growth", "campaign", "content",
+)
+
+
+def _load_skills_context(topic: str = "") -> str:
+    """话题与营销相关时才加载营销知识，否则跳过。"""
+    if topic:
+        lower = topic.lower()
+        if not any(kw in lower for kw in _MARKETING_SIGNALS):
+            return ""
     return load_skill_context("marketing", max_modules=10, header_chars=500)
 
 
 def refine_brief(topic: str, context: str) -> str:
-    skills = _load_skills_context()
+    skills = _load_skills_context(topic)
     user_msg = f"原始需求：\n{topic}\n\n背景材料：\n{context[:8000] if len(context) > 8000 else context}"
     if skills:
         user_msg += f"\n\n{skills[:4000]}"

@@ -34,7 +34,9 @@ from lark_oapi import EventDispatcherHandler, LogLevel
 
 from core.feishu_client import reply_message, reply_card, send_message_to_user, send_card_to_user
 from core.cards import welcome_card, progress_card, result_card, error_card, help_card
+from core.llm import chat_completion
 from planner.run import run_planning, detect_mode
+from planner.prompts import PLANNER_SYSTEM
 
 # ── 日志 ─────────────────────────────────────────────────────
 
@@ -72,28 +74,32 @@ _MODE_PREFIXES = (
 def _welcome() -> dict:
     return welcome_card(
         "规划机器人",
-        "告诉我你想规划什么，我会用 **理性六步法** 帮你从问题定义到执行方案一步步拆解。",
+        "可以聊任何话题，也可以做深度规划。\n\n"
+        "**直接聊** → 我像朋友一样跟你讨论\n"
+        "**发「规划：话题」** → 启动理性六步法深度拆解",
         examples=[
-            "设计一个 AI agent 系统来自动化日常工作",
+            "最近想转行，不知道该不该",
+            "周末想做个 side project，帮我想想方向",
             "规划：Q3 用户增长策略",
             "快速模式：下周产品发布计划",
         ],
-        hints=["消息前加「快速模式：」可切换模式", "发送「帮助」查看所有模式"],
+        hints=["日常问题直接发，复杂决策加「规划：」前缀", "发送「帮助」查看所有模式"],
     )
 
 
 def _help() -> dict:
     return help_card("规划机器人", [
-        ("使用方式", "直接发消息即为规划主题，可加「规划：」前缀。"),
+        ("日常对话", "直接发消息，我像朋友一样聊。生活、职业、兴趣、想法都行。"),
+        ("深度规划", "消息前加「规划：」触发理性六步法：\n> 规划：要不要读个 MBA\n> 规划：Q3 用户增长策略"),
         ("五种模式",
-         "**完整规划**（默认）问题定义 → 现状分析 → 方案生成 → 评估矩阵 → 执行计划 → 反馈机制\n"
-         "**快速模式** 跳过现状分析和反馈机制，更快出结果\n"
-         "**分析模式** 仅做问题定义 + 现状分析\n"
-         "**方案模式** 仅生成 3 个战略方案\n"
+         "**完整规划**（默认）六步全走\n"
+         "**快速模式** 跳过现状分析和反馈，更快\n"
+         "**分析模式** 仅问题定义 + 现状分析\n"
+         "**方案模式** 仅生成 3 个方案\n"
          "**执行模式** 仅生成执行计划"),
-        ("切换模式", "在消息前加模式名即可：\n> 快速模式：下周产品发布计划\n> 分析模式：竞品定价策略"),
-        ("多行消息", "第一行 = 主题\n其余行 = 背景材料"),
-    ], footer="规划过程约 2-4 分钟，实时推送到飞书群")
+        ("切换模式", "在消息前加模式名：\n> 快速模式：下周产品发布计划"),
+        ("多行消息", "第一行 = 主题，其余行 = 背景材料"),
+    ], footer="对话秒回 | 规划约 2-4 分钟")
 
 
 def _extract_text(content: str) -> str:
@@ -128,6 +134,63 @@ def _parse_planning_input(text: str) -> tuple[str, str, str]:
     if context.startswith("---"):
         context = context[3:].strip()
     return topic, context, mode
+
+
+# ── 对话模式（非规划） ───────────────────────────────────────
+
+_PLANNING_SIGNALS = (
+    "规划", "计划", "策略", "方案", "怎么做", "怎么搞", "如何",
+    "plan", "strategy", "how to", "how do",
+    "帮我想想", "帮我分析", "帮我拆解",
+)
+
+_PLANNING_PREFIXES = _TOPIC_PREFIXES + _MODE_PREFIXES
+
+
+def _needs_planning(text: str) -> bool:
+    """判断消息是否需要走完整规划流水线。"""
+    t = text.strip()
+    for prefix in _PLANNING_PREFIXES:
+        if t.lower().startswith(prefix) or t.startswith(prefix):
+            return True
+    lower = t.lower()
+    if any(sig in lower for sig in _PLANNING_SIGNALS):
+        return True
+    if len(t) > 100:
+        return True
+    return False
+
+
+_CHAT_SYSTEM = PLANNER_SYSTEM + """
+
+当前是对话模式——不走六步流水线，但你仍然是一个有方案的人。
+
+你要做的：
+1. 先听清楚用户在说什么、真正纠结的是什么
+2. 给出你的判断（不是"各有利弊"这种废话）
+3. 如果值得，给 1-2 个具体方案或建议，附理由
+4. 如果有思维盲区，直接指出
+
+不要做的：
+- 不要变成情感陪聊（"我理解你的感受"然后没了）
+- 不要变成信息搬运工（百度能查到的不用你说）
+- 不要没有立场
+
+话题可以是任何事：生活、职业、关系、兴趣、side project、纠结的选择。
+保持简洁。一个好回复 = 一个判断 + 一个方案 + 一个用户没想到的角度。
+
+如果问题复杂到值得深度拆解，建议用户："这个值得认真规划一下，发「规划：你的问题」我帮你系统拆。"
+"""
+
+
+def _chat_reply(text: str) -> str:
+    """轻量对话：单轮 LLM 回复。"""
+    try:
+        from core.skill_router import enrich_prompt
+        system = enrich_prompt(_CHAT_SYSTEM, user_text=text, bot_type="planner")
+    except Exception:
+        system = _CHAT_SYSTEM
+    return chat_completion(provider="deepseek", system=system, user=text).strip()
 
 
 # ── 运行中追踪 ───────────────────────────────────────────────
@@ -167,6 +230,17 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             if lower in ("帮助", "help", "?", "？"):
                 reply_card(mid, _help())
                 return
+
+            if not _needs_planning(text):
+                _log(f"对话模式: {text[:60]!r}")
+                try:
+                    answer = _chat_reply(text)
+                    reply_message(mid, answer)
+                except Exception as e:
+                    _log(f"对话回复异常: {e}")
+                    reply_message(mid, "抱歉，出了点问题，稍后再试。")
+                return
+
             topic, context, mode = _parse_planning_input(text)
             if not topic:
                 reply_card(mid, _welcome())

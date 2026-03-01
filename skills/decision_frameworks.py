@@ -105,6 +105,7 @@ class DecisionFrameworksSkill(Skill):
         "规划", "决策", "方案", "选择", "评估", "优先级", "取舍",
         "plan", "decision", "strategy", "evaluate", "tradeoff",
         "怎么选", "该不该", "值不值", "风险",
+        "帮我想想", "帮我分析", "拆解",
     ]
     bot_types = ["planner"]
 

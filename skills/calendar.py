@@ -24,7 +24,7 @@ class CalendarSkill(Skill):
     name = "calendar"
     description = "营销日历 — 节假日、电商大促、季节性选题节点"
     trigger_keywords = ["日历", "节日", "节点", "排期", "什么时候发", "选题", "calendar"]
-    bot_types = ["planner", "conductor"]
+    bot_types = ["conductor"]
 
     def __init__(self, path: Optional[Path] = None):
         self.path = path or CALENDAR_PATH

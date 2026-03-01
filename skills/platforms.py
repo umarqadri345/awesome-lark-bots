@@ -35,7 +35,7 @@ class PlatformSkill(Skill):
         "小红书", "抖音", "B站", "微博", "快手", "知乎",
         "平台", "发布", "算法", "推荐", "标签", "封面",
     ]
-    bot_types = ["conductor", "planner"]
+    bot_types = ["conductor"]
 
     def __init__(self, guides_dir: Optional[Path] = None):
         self.guides_dir = guides_dir or GUIDES_DIR

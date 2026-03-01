@@ -88,7 +88,7 @@ class StakeholderSkill(Skill):
         "stakeholder", "alignment", "buy-in", "cross-team",
         "网易", "TGC", "合作方", "利益", "协作",
     ]
-    bot_types = ["planner"]
+    bot_types = []
 
     def get_context(self, **kwargs) -> str:
         return _STAKEHOLDER.strip()

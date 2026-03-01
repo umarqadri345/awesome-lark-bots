@@ -79,35 +79,44 @@ def _log(msg: str) -> None:
 
 _TOPIC_PREFIXES = ("脑暴 ", "脑暴：", "脑暴:", "brainstorm ", "brainstorm:", "brainstorm：")
 
+# 不当作脑暴主题的废话/打招呼：命中则回欢迎卡片，不启动脑暴
+_NOT_TOPIC_PHRASES = frozenset({
+    "在吗", "在么", "你好", "嗨", "哈喽", "hi", "hello", "hey",
+    "哈哈", "呵呵", "啊啊", "嗯", "哦", "好的", "好", "行", "1", "2", "测试", "试试",
+    "？", "?", "？？", "。。", "啥", "怎么", "为什么", "啥意思",
+    "开始", "start", "go", "来", "在", "喂", "呀", "呢", "吗",
+})
+_MIN_TOPIC_LEN = 3  # 主题至少几个字符才当作有效（过滤单字、双字废话）
+
 def _welcome() -> dict:
     return welcome_card(
         "脑暴机器人",
-        "**使用方式：**直接发消息，内容即为脑暴主题。可加「脑暴：」前缀，也可以不加。\n\n"
-        "**脑暴流程：**\n"
-        "1️⃣ DeepSeek 优化主题\n"
-        "2️⃣ 坚果五仁团队四轮讨论（实时推送飞书群）\n"
-        "3️⃣ 最终交付（总结 + Claude Code prompt + 视觉 prompt）",
+        "什么话题都可以脑暴。发消息即可，系统会自动识别类型。\n\n"
+        "**脑暴流程：** DeepSeek 优化主题 → 坚果五仁四轮讨论 → 最终交付",
         examples=[
-            "咖啡品牌 × 音乐节跨界联动",
-            "脑暴：博物馆夜间沉浸式体验",
-            "宠物友好社区活动策划",
+            "帮哆啦A梦造势 它一定能赢过奥特曼",
+            "设计一个让猫主动帮你干活的智能家居",
+            "怎样优雅地在周一早上假装很有精神",
         ],
-        hints=["多行消息：第一行为主题，其余为背景材料", "发送「帮助」查看完整说明"],
+        hints=["营销/创意项目/生活话题均可", "多行消息：第一行主题，其余背景", "发「帮助」查看说明"],
     )
 
 
 def _help() -> dict:
     return help_card("脑暴机器人", [
         ("使用方式", "直接发消息，内容即为脑暴主题。\n可加「脑暴：」前缀，也可以不加。"),
+        ("三种模式（自动识别）",
+         "**营销活动** — 品牌联动、线下活动、内容策略\n"
+         "→ 交付：讨论总结 + Claude Code prompt + 视觉 prompt\n\n"
+         "**创意项目** — 产品设计、游戏设计、side project\n"
+         "→ 交付：讨论总结 + MVP 定义 + Claude Code prompt\n\n"
+         "**通用探索** — 生活决策、职业规划、个人目标\n"
+         "→ 交付：讨论总结 + 行动方案"),
         ("多行消息", "第一行 = 主题\n其余行 = 背景材料"),
-        ("脑暴流程",
-         "1️⃣ DeepSeek 优化主题\n"
-         "2️⃣ 坚果五仁团队四轮讨论（实时推送飞书群）\n"
-         "3️⃣ 最终交付（总结 + Claude Code prompt + 视觉 prompt）"),
         ("示例",
-         "> 咖啡品牌 × 音乐节跨界联动\n"
-         "> 脑暴：博物馆夜间沉浸式体验\n"
-         "> 宠物友好社区活动策划"),
+         "> 帮哆啦A梦造势 它一定能赢过奥特曼\n"
+         "> 设计一个让猫主动帮你干活的智能家居\n"
+         "> 怎样优雅地在周一早上假装很有精神"),
     ], footer="脑暴过程约 3-5 分钟，完成后会通知你")
 
 
@@ -130,6 +139,7 @@ def _parse_brainstorm_input(text: str) -> tuple[str, str]:
 
     规则：第一行为主题，后续行为背景材料。
     支持去掉「脑暴：」等前缀。
+    废话/打招呼/过短内容不当作主题，返回 ("", "") 以触发欢迎卡片。
     """
     t = (text or "").strip()
     for prefix in _TOPIC_PREFIXES:
@@ -141,6 +151,12 @@ def _parse_brainstorm_input(text: str) -> tuple[str, str]:
     context = lines[1].strip() if len(lines) > 1 else ""
     if context.startswith("---"):
         context = context[3:].strip()
+    # 废话过滤：打招呼、无意义短句不启动脑暴
+    if not topic or len(topic) < _MIN_TOPIC_LEN:
+        return "", ""
+    lower_topic = topic.lower().strip()
+    if lower_topic in _NOT_TOPIC_PHRASES:
+        return "", ""
     return topic, context
 
 
@@ -203,7 +219,11 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             ))
             _log(f"启动脑暴: topic={topic[:80]!r}")
             try:
-                path = run_brainstorm(topic=topic, context=context)
+                # 脑暴机器人发起的脑暴 → 推送到脑暴专用 webhook（与 conductor 发起的脑暴分群）
+                brainstorm_webhook = (
+                    os.environ.get("BRAINSTORM_FEISHU_WEBHOOK") or os.environ.get("FEISHU_WEBHOOK") or ""
+                ).strip() or None
+                path = run_brainstorm(topic=topic, context=context, webhook=brainstorm_webhook)
                 done_card = result_card(
                     "脑暴完成",
                     fields=[("主题", topic[:100]), ("会话文件", f"`{path}`")],
