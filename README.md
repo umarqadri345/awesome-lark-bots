@@ -10,6 +10,19 @@
 
 > **这是一个活跃探索中的项目。** 我们把它开源出来，是因为相信 AI + 飞书的自动化工作流有很大的想象空间，也希望有更多人一起来完善它。欢迎提 Issue、提 PR，或者单纯 star 一下表示支持。
 
+### 为什么做这个？
+
+我们相信 **不需要给 AI 完整的系统权限，也能让它帮你把大部分工作干了。**
+
+思路很简单：
+
+- **日常自动化**（脑暴、规划、舆情采集、内容创作、定时发布……）→ 部署在云端，用**飞书聊天**作为交互入口，随时随地发条消息就能触发，轻量、安全、低权限
+- **深度任务**（复杂架构设计、大规模代码重构……）→ 需要时再用 Claude Code 等重型工具，按需授权
+
+大多数工作场景不需要把钥匙全交给 AI。一个聊天窗口 + 几个专注的机器人，够了。
+
+---
+
 ## 七个机器人一览
 
 | 机器人 | 一句话介绍 | 在飞书上怎么用 | 启动命令 |
@@ -425,6 +438,17 @@ docker-compose logs -f brainstorm
 A collection of 7 open-source AI bots running on **Feishu (Lark)**, covering brainstorming, planning, daily assistance, creative prompt generation, social media monitoring, news aggregation, and end-to-end content creation workflows.
 
 All bots are **compatible with any LLM that supports the OpenAI API protocol** — DeepSeek, OpenAI, Claude, Doubao, Kimi, Qwen, GLM, and more. Just change the API keys in `.env`.
+
+### Why?
+
+**You don't need to give AI full system access to get real work done.**
+
+Our approach:
+
+- **Routine automation** (brainstorming, planning, content creation, social monitoring, publishing…) → runs in the cloud, with **Feishu chat as the frontend**. Send a message, get things done. Lightweight, secure, minimal permissions.
+- **Deep work** (complex architecture, large-scale refactoring…) → use heavy-duty tools like Claude Code when needed, with explicit access.
+
+Most work scenarios don't require handing over all the keys. A chat window + a few focused bots is enough.
 
 ### The 7 Bots
 
