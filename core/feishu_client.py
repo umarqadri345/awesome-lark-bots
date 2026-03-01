@@ -530,6 +530,70 @@ def _parse_markdown_table(content: str) -> tuple[list[str], list[list[str]], str
     return headers, rows, extra_text
 
 
+def _style_spreadsheet(
+    ss_token: str, sheet_id: str,
+    headers: list[str], rows: list[list[str]],
+    end_col: str, token: str,
+) -> None:
+    """美化飞书电子表格：表头加粗+背景色、列宽自适应、冻结首行。
+
+    所有操作 best-effort，失败不影响主流程。
+    """
+    hdrs = _headers(token)
+
+    # 表头：加粗 + 浅灰背景 + 居中
+    try:
+        requests.put(
+            f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{ss_token}/style",
+            json={"appendStyle": {
+                "range": f"{sheet_id}!A1:{end_col}1",
+                "style": {
+                    "bold": True,
+                    "backColor": "#E8EAED",
+                    "hAlign": 1,
+                    "fontSize": 10,
+                },
+            }},
+            headers=hdrs, timeout=10,
+        )
+    except Exception:
+        pass
+
+    # 列宽：根据各列最长内容自适应（中文 ~14px/字）
+    dim_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{ss_token}/dimension_range"
+    for col_idx in range(len(headers)):
+        max_len = len(headers[col_idx]) if col_idx < len(headers) else 0
+        for row in rows:
+            if col_idx < len(row):
+                max_len = max(max_len, len(row[col_idx]))
+        width = min(max(max_len * 14 + 24, 60), 400)
+        try:
+            requests.put(dim_url, json={
+                "dimension": {
+                    "sheetId": sheet_id,
+                    "majorDimension": "COLUMNS",
+                    "startIndex": col_idx,
+                    "endIndex": col_idx + 1,
+                },
+                "dimensionProperties": {"fixedSize": width},
+            }, headers=hdrs, timeout=10)
+        except Exception:
+            pass
+
+    # 冻结首行
+    try:
+        requests.post(
+            f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{ss_token}/sheets_batch_update",
+            json={"requests": [{"updateSheet": {"properties": {
+                "sheetId": sheet_id,
+                "frozenRowCount": 1,
+            }}}]},
+            headers=hdrs, timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def create_spreadsheet_with_data(
     title: str,
     headers: list[str],
@@ -600,6 +664,8 @@ def create_spreadsheet_with_data(
     if d3.get("code") != 0:
         _warn(f"写入表格数据失败: code={d3.get('code')} msg={d3.get('msg')}")
 
+    _style_spreadsheet(ss_token, sheet_id, headers, rows, end_col, token)
+
     if owner_open_id:
         perm_url = f"{FEISHU_API_BASE}/drive/v1/permissions/{ss_token}/members"
         try:
@@ -634,3 +700,143 @@ def create_spreadsheet_from_markdown(
     if not headers or not rows:
         return False, "未找到有效的表格数据"
     return create_spreadsheet_with_data(title, headers, rows, extra, owner_open_id)
+
+
+# ── 项目看板（基于电子表格）──────────────────────────────────
+# 用已有的 create_spreadsheet_with_data 创建项目管理表格。
+
+PROJECT_BOARD_HEADERS = ["任务名称", "负责人", "状态", "优先级", "截止日期", "备注"]
+
+
+def create_project_board(
+    name: str,
+    tasks: Optional[list[dict]] = None,
+    owner_open_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """一步创建项目看板电子表格。
+
+    Args:
+        name: 项目名称
+        tasks: 初始任务，如 [{"任务名称": "设计", "负责人": "张三", "状态": "待开始"}, ...]
+        owner_open_id: 授予编辑权限的用户
+
+    Returns: (ok, url_or_error)
+    """
+    headers = PROJECT_BOARD_HEADERS
+    rows: list[list[str]] = []
+    for t in (tasks or []):
+        row = [str(t.get(h, "")) for h in headers]
+        rows.append(row)
+    if not rows:
+        rows.append(["（示例）确定项目目标", "", "待开始", "P1-重要", "", ""])
+    return create_spreadsheet_with_data(
+        title=f"📋 {name}",
+        headers=headers,
+        rows=rows,
+        owner_open_id=owner_open_id,
+    )
+
+
+def append_spreadsheet_rows(
+    spreadsheet_token: str,
+    sheet_id: str,
+    rows: list[list[str]],
+) -> Tuple[bool, str]:
+    """往已有电子表格追加行。"""
+    try:
+        url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values_append"
+        num_cols = max(len(r) for r in rows) if rows else 1
+        end_col = chr(64 + min(num_cols, 26))
+        range_str = f"{sheet_id}!A1:{end_col}1"
+        padded = [r + [""] * (num_cols - len(r)) for r in rows]
+        resp = requests.post(
+            url,
+            json={"valueRange": {"range": range_str, "values": padded}},
+            headers=_headers(),
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "追加行失败") or str(data)
+        return True, f"已追加 {len(rows)} 行"
+    except Exception as e:
+        return False, f"追加行异常: {e}"
+
+
+# ── 飞书任务（Task）──────────────────────────────────────────
+# 轻量级任务管理：创建的任务会出现在飞书「任务中心」。
+# 用 tenant_access_token 创建的任务归应用所有，需要加执行者后对方才能看到。
+# 权限要求：task:task:readwrite
+
+def create_task(
+    summary: str,
+    description: str = "",
+    due_timestamp: Optional[str] = None,
+    collaborator_open_ids: Optional[list[str]] = None,
+) -> Tuple[bool, str, str]:
+    """创建飞书任务。
+
+    Args:
+        summary: 任务标题
+        description: 任务描述
+        due_timestamp: 截止时间戳（秒）
+        collaborator_open_ids: 执行者 open_id 列表
+
+    Returns: (ok, task_id_or_error, message)
+    """
+    try:
+        url = f"{FEISHU_API_BASE}/task/v1/tasks"
+        body: dict = {"summary": summary}
+        if description:
+            body["description"] = description
+        if due_timestamp:
+            body["due"] = {"timestamp": str(due_timestamp), "is_all_day": False}
+        resp = requests.post(url, json=body, headers=_headers(), timeout=10)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "创建任务失败") or str(data), ""
+        task = (data.get("data") or {}).get("task") or {}
+        task_id = task.get("id", "")
+        if not task_id:
+            return False, "创建成功但未返回 task_id", ""
+
+        added = []
+        for oid in (collaborator_open_ids or []):
+            if oid:
+                _add_task_collaborator(task_id, oid)
+                added.append(oid)
+
+        msg = f"任务已创建"
+        if added:
+            msg += f"，已分配给 {len(added)} 人"
+        return True, task_id, msg
+    except Exception as e:
+        return False, f"创建任务异常: {e}", ""
+
+
+def _add_task_collaborator(task_id: str, open_id: str) -> bool:
+    try:
+        url = f"{FEISHU_API_BASE}/task/v1/tasks/{task_id}/collaborators"
+        resp = requests.post(
+            url, json={"id": open_id, "id_type": "open_id"},
+            headers=_headers(), timeout=10,
+        )
+        return resp.json().get("code") == 0
+    except Exception:
+        return False
+
+
+def complete_task(task_id: str) -> Tuple[bool, str]:
+    """完成飞书任务。"""
+    try:
+        url = f"{FEISHU_API_BASE}/task/v1/tasks/{task_id}"
+        resp = requests.patch(
+            url, json={"task": {"status": "completed"}},
+            headers=_headers(), timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "完成任务失败") or str(data)
+        return True, "任务已标记完成"
+    except Exception as e:
+        return False, f"完成任务异常: {e}"
