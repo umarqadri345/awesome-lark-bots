@@ -686,7 +686,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         return
                     ok, result = create_spreadsheet_with_data(
                         title=title, headers=headers, rows=rows,
-                        owner_open_id=user_open_id,
+                        owner_open_id=user_open_id, theme="blue",
                     )
                     if ok:
                         reply_card(mid, action_card(
