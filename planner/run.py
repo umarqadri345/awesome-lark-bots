@@ -74,7 +74,7 @@ def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tup
     for prev_num, prev_name, prev_output in previous_outputs:
         parts.append(f"--- 第 {prev_num} 步 {prev_name} 的输出 ---\n{prev_output}")
     parts.append(instruction)
-    parts.append("如果加载了领域知识/框架 skill，在分析中显式调用。标了「如相关才写」的字段，不相关就跳过。")
+    parts.append("标了「如相关才写」的字段，不相关就跳过。像正常人说话，不要贴框架名当标签。")
     user_msg = "\n\n".join(parts)
     try:
         from core.skill_router import enrich_prompt

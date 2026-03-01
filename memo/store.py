@@ -99,11 +99,14 @@ def list_memos(
     user_open_id: Optional[str] = None,
     category: Optional[str] = None,
     thread: Optional[str] = None,
+    include_done: bool = False,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     items = _load_all()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
+    if not include_done:
+        items = [m for m in items if not m.get("done")]
     cat_key = _normalize_category(category)
     if cat_key:
         items = [m for m in items if (m.get("category") or "") == cat_key]
@@ -213,6 +216,64 @@ def mark_reminder_sent(memo_id: str) -> None:
                 m["reminder_sent"] = True
                 break
         _save_all_unlocked(items)
+
+
+def complete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = None) -> tuple[bool, str]:
+    """标记某条备忘为已完成（不删除，只标记）。"""
+    with _lock:
+        all_items = _load_all_unlocked()
+        items = list(all_items)
+        if user_open_id:
+            items = [m for m in items if m.get("user_open_id") == user_open_id]
+        items = [m for m in items if not m.get("done")]
+        items.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+        if index_one_based < 1 or index_one_based > len(items):
+            return False, f"序号需在 1～{len(items)} 之间（未完成的共 {len(items)} 条）。"
+        target = items[index_one_based - 1]
+        memo_id = target.get("id")
+        content_preview = (target.get("content") or "")[:30]
+        thread = target.get("thread") or ""
+        for m in all_items:
+            if m.get("id") == memo_id:
+                m["done"] = True
+                m["done_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                break
+        _save_all_unlocked(all_items)
+    tag = f" #{thread}" if thread else ""
+    return True, f"✅ 已完成第 {index_one_based} 条{tag}：{content_preview}"
+
+
+def complete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -> tuple[bool, str]:
+    """按内容关键词模糊匹配并标记完成。"""
+    with _lock:
+        all_items = _load_all_unlocked()
+        items = list(all_items)
+        if user_open_id:
+            items = [m for m in items if m.get("user_open_id") == user_open_id]
+        items = [m for m in items if not m.get("done")]
+        kw = keyword.strip().lower()
+        matched = [m for m in items if kw in (m.get("content") or "").lower()]
+        if not matched:
+            return False, f"没找到包含「{keyword}」的未完成备忘。"
+        if len(matched) > 1:
+            lines = [f"找到 {len(matched)} 条匹配，请用序号指定："]
+            for i, m in enumerate(matched[:5], 1):
+                thread = m.get("thread") or ""
+                tag = f" [#{thread}]" if thread else ""
+                lines.append(f"  {i}. {tag} {(m.get('content') or '')[:40]}")
+            return False, "\n".join(lines)
+        target = matched[0]
+        memo_id = target.get("id")
+        content_preview = (target.get("content") or "")[:30]
+        thread = target.get("thread") or ""
+        for m in all_items:
+            if m.get("id") == memo_id:
+                m["done"] = True
+                m["done_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                break
+        _save_all_unlocked(all_items)
+    tag = f" #{thread}" if thread else ""
+    return True, f"✅ 已完成{tag}：{content_preview}"
 
 
 def delete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = None) -> tuple[bool, str]:

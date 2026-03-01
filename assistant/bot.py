@@ -56,6 +56,8 @@ from memo.store import (
     list_memos as store_list_memos,
     delete_memo_by_index as store_delete_memo_by_index,
     set_memo_category_by_index as store_set_memo_category_by_index,
+    complete_memo_by_index as store_complete_by_index,
+    complete_memo_by_content as store_complete_by_content,
     list_threads as store_list_threads,
     thread_summary as store_thread_summary,
     get_due_reminders,
@@ -230,6 +232,20 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_message(mid, "请说「备忘 具体内容」或「任务 具体内容」～")
                 return
 
+            # ── 完成备忘 ──
+            m_done = re.match(r"^(完成|done|搞定|✅)\s*[：:]?\s*(\d+)$", t, re.IGNORECASE)
+            if m_done:
+                idx = int(m_done.group(2))
+                ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+            m_done_kw = re.match(r"^(完成|done|搞定|✅)\s*[：:]?\s*(.+)$", t, re.IGNORECASE)
+            if m_done_kw:
+                keyword = m_done_kw.group(2).strip()
+                ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+
             # ── 清除备忘 ──
             m_clear = re.match(r"^(清除备忘|删除备忘)\s*[：:]\s*(\d+)$", t)
             if not m_clear:
@@ -318,17 +334,25 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             if action == "list_memos":
-                memos = store_list_memos(limit=10, user_open_id=user_open_id)
+                thread_filter = params.get("thread", "")
+                inc_done = params.get("include_done", False)
+                memos = store_list_memos(
+                    limit=15, user_open_id=user_open_id,
+                    thread=thread_filter or None, include_done=inc_done,
+                )
                 if not memos:
                     reply_card(mid, action_card("📋 暂无备忘", hints=["发「备忘 内容」开始记"], color="blue"))
                     return
                 lines = []
                 for i, m in enumerate(memos, 1):
-                    lines.append(f"{i}. {_memo_category_tag(m)}{m.get('content', '')}")
+                    thread = m.get("thread") or ""
+                    tag = f"[#{thread}] " if thread else ""
+                    done = "✅ " if m.get("done") else ""
+                    lines.append(f"{i}. {done}{tag}{m.get('content', '')}")
                 reply_card(mid, action_card(
                     f"📋 备忘列表（{len(memos)} 条）",
                     "\n".join(lines)[:2000],
-                    hints=["「清除备忘 3」删除", "「第2条标成灵感」改分类"],
+                    hints=["「完成 3」标记完成", "「完成 买牛奶」按内容完成", "「清除备忘 3」彻底删除"],
                     color="blue",
                 ))
                 return
@@ -336,22 +360,27 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             if action == "list_tasks":
                 memos = store_list_memos(limit=10, user_open_id=user_open_id)
                 if not memos:
-                    reply_message(mid, "暂无备忘。")
+                    reply_message(mid, "暂无未完成的备忘。")
                     return
-                lines = ["最近备忘（可用「清除备忘 序号」删除）："]
+                lines = ["未完成备忘（「完成 序号」标记完成）："]
                 for i, m in enumerate(memos, 1):
-                    lines.append(f"{i}. {_memo_category_tag(m)}{m.get('content', '')}")
+                    thread = m.get("thread") or ""
+                    tag = f"[#{thread}] " if thread else ""
+                    lines.append(f"{i}. {tag}{m.get('content', '')}")
                 reply_message(mid, "\n".join(lines)[:2000])
                 return
 
             if action == "list_all_memos":
-                memos = store_list_memos(limit=200, user_open_id=user_open_id)
+                memos = store_list_memos(limit=200, user_open_id=user_open_id, include_done=True)
                 if not memos:
                     reply_message(mid, "暂无备忘。")
                     return
-                lines = [f"所有备忘（共 {len(memos)} 条，可用「清除备忘 序号」删除）："]
+                lines = [f"所有备忘（共 {len(memos)} 条，含已完成）："]
                 for i, m in enumerate(memos, 1):
-                    lines.append(f"{i}. {_memo_category_tag(m)}{m.get('content', '')}")
+                    thread = m.get("thread") or ""
+                    tag = f"[#{thread}] " if thread else ""
+                    done = "✅ " if m.get("done") else ""
+                    lines.append(f"{i}. {done}{tag}{m.get('content', '')}")
                 reply_message(mid, "\n".join(lines)[:4000])
                 return
 
@@ -396,8 +425,23 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_message(mid, msg_text)
                 return
 
+            if action == "complete_memo":
+                idx = params.get("index")
+                keyword = params.get("keyword", "")
+                if idx is not None:
+                    try:
+                        ok, msg_text = store_complete_by_index(int(idx), user_open_id=user_open_id)
+                    except (ValueError, TypeError):
+                        ok, msg_text = False, "序号需为数字，例如：完成 3"
+                elif keyword:
+                    ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
+                else:
+                    ok, msg_text = False, "请说「完成 3」（按序号）或「完成 买牛奶」（按内容）"
+                reply_message(mid, msg_text)
+                return
+
             if action == "complete_task":
-                reply_message(mid, "已统一为备忘啦，没有单独勾选完成。可以说「备忘列表」查看～")
+                reply_message(mid, "请用「完成 序号」或「完成 关键词」来标记备忘完成～")
                 return
 
             # ── 线程相关 ──
@@ -603,8 +647,10 @@ def _help() -> dict:
          "> **哪条线最久没动** — 查沉寂线程\n"
          "> **周报** — 本周线程概览"),
         ("查看 / 管理备忘",
-         "> 备忘列表 · 所有备忘\n"
-         "> 清除备忘 3（删除第3条）"),
+         "> 备忘列表 — 查看未完成备忘\n"
+         "> **完成 3** — 标记第3条完成 ✅\n"
+         "> **完成 买牛奶** — 按内容完成\n"
+         "> 清除备忘 3 — 彻底删除第3条"),
         ("日程管理",
          "> 明天下午3点开会 → 自动加入飞书日历\n"
          "> 今天 / 明天 → 查看日程安排"),
