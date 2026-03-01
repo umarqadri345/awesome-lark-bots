@@ -29,8 +29,8 @@
 |--------|-----------|---------------|----------|
 | **自媒体助手** ⚗️ | 自媒体全流程编排：输入主题 → 自动脑暴+规划+创作+存储+定时发布 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
 | **脑暴机器人** | 5 个 AI 角色模拟真人团队讨论，四轮产出创意方案 | 发消息：`咖啡品牌 × 音乐节跨界联动` | `python3 -m brainstorm` |
-| **规划机器人** | 六步结构化决策 + 决策框架自动注入（第一性原理、pre-mortem 等） | 发消息：`Q3 用户增长策略` | `python3 -m planner` |
-| **助手机器人** | 记备忘、追踪工作线程、管日程、日报/周报/提醒 | 发消息：`备忘 完成deck #creator` / `线程` / `周报` | `python3 -m assistant` |
+| **规划机器人** | 六步结构化决策 + 自动生成飞书文档（Brief / 日历 / 时间线 / Spec 等 10 种） | 发消息：`规划：Q3 用户增长策略` | `python3 -m planner` |
+| **助手机器人** | 记备忘、追踪工作线程、管日程、日报/周报/提醒、联网研究 | 发消息：`备忘 完成deck #creator` / `研究 话题` | `python3 -m assistant` |
 | **创意 Prompt** | 生成 Seedance / Nano Banana 等 AI 工具可用的素材 prompt | 发消息：`春日樱花的抖音预告` | `python3 -m creative` |
 | **舆情监控** | 从微博/抖音/小红书等 15 个平台采集社媒数据 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
 | **早知天下事** | 多源新闻聚合 + AI 分析，每日推送新闻简报 | 发消息：`新闻` / `科技新闻` | `python3 -m newsbot` |
@@ -152,9 +152,12 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 
 ### 2. 规划机器人 (`planner/`)
 
-给机器人发消息即可启动理性规划。
+给机器人发消息即可启动理性规划。支持两种交互模式：
 
-**五种模式：**
+- **直接聊** → 像朋友一样讨论，给判断、给方案、指出盲区
+- **发「规划：话题」** → 启动六步结构化深度拆解，完成后可生成飞书文档
+
+**五种规划模式：**
 | 模式 | 包含步骤 | 适合场景 |
 |------|---------|---------|
 | 完整规划 | 问题定义→现状分析→方案生成→评估矩阵→执行计划→反馈机制 | 重大决策 |
@@ -162,6 +165,19 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 | 分析模式 | 问题定义+现状分析 | 想先看看分析 |
 | 方案模式 | 生成 3 个方案 | 只要选项 |
 | 执行模式 | 执行计划 | 已有方向，要落地步骤 |
+
+**文档交付：** 规划完成后自动弹出文档菜单，根据话题类型智能推荐：
+
+| 话题类型 | 检测信号 | 可生成的文档 |
+|---------|---------|------------|
+| 营销/活动 | 营销、品牌、落地、二创、小红书… | 执行 Brief、内容日历、里程碑时间线、决策备忘 |
+| 旅行 | 旅行、机票、酒店、行程… | 行程表、预算清单、打包清单、决策备忘 |
+| 创意项目 | 项目、开发、做个、MVP、app… | 项目 Spec、功能优先级、行动清单、决策备忘 |
+| 通用 | 默认 | 执行 Brief、行动清单、里程碑时间线、决策备忘 |
+
+- 回复数字选择文档（`1` 单个 / `123` 多个合并 / `全部`）
+- 自动创建飞书云文档（支持标题、加粗、列表等格式）并发送链接
+- 文档标题由 LLM 自动凝练（如"五月日本十日游 — 执行 Brief"）
 
 **切换模式：** 在消息前加模式名，如 `快速模式：下周产品发布计划`
 
@@ -172,7 +188,7 @@ python3 -m planner.run --topic "Q3 用户增长策略" --mode "快速模式"
 
 ### 3. 助手机器人 (`assistant/`)
 
-日常工作伴侣：记备忘、管日程、追踪工作线程、自动推送日报/周报。
+日常工作伴侣：记备忘、管日程、追踪工作线程、联网研究、自动推送日报/周报。
 
 **备忘 + 工作线程：**
 ```
@@ -185,6 +201,15 @@ python3 -m planner.run --topic "Q3 用户增长策略" --mode "快速模式"
 ```
 
 > 线程（thread）替代了旧的三分类系统。用 `#标签` 手动打标，或由 AI 根据你的 personal skill profile 自动识别。
+
+**联网研究（Research）：**
+```
+研究 Character.ai 增长机制        → 多来源搜索 + 交叉验证 + 结构化报告
+调研 2026 AI agent 框架对比       → 自动分析机制、输出带置信度标记的报告
+fact check Threads 增长是 organic 吗  → 事实核查模式
+```
+
+> 使用 Tavily API（免费 1000 次/月），未配置则自动降级到 DuckDuckGo。
 
 **日程管理：**
 ```
@@ -314,14 +339,18 @@ awesome-lark-bots/
 │   └── __main__.py           #   启动入口：python3 -m brainstorm
 │
 ├── planner/                  # 规划机器人
-│   ├── bot.py                #   飞书长连接入口
-│   ├── run.py                #   主流程引擎（六步规划）
-│   ├── prompts.py            #   每一步的提示词和输出格式定义
+│   ├── bot.py                #   飞书长连接入口（对话+规划+文档交付）
+│   ├── run.py                #   主流程引擎（六步规划 + 文档生成）
+│   ├── prompts.py            #   规划提示词 + 10 种文档模板
 │   └── __main__.py           #   启动入口：python3 -m planner
 │
 ├── assistant/                # 助手机器人
-│   ├── bot.py                #   飞书长连接入口（备忘+日程+对话）
+│   ├── bot.py                #   飞书长连接入口（备忘+日程+研究+对话）
 │   └── __main__.py           #   启动入口：python3 -m assistant
+│
+├── research/                 # 联网研究模块（助手机器人调用）
+│   ├── researcher.py         #   研究引擎：多来源搜索+交叉验证+报告生成
+│   └── search.py             #   搜索抽象层（Tavily / DuckDuckGo）
 │
 ├── creative/                 # 创意 Prompt 机器人
 │   ├── bot.py                #   飞书长连接入口（生成+讨论+品牌切换）
@@ -546,8 +575,8 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 |-----|-------------|---------|
 | **Content Assistant** ⚗️ | End-to-end content pipeline: topic → brainstorm → plan → create → store → publish | `python3 -m conductor` |
 | **Brainstorm** | 5 AI personas simulate a real team discussion in 4 rounds | `python3 -m brainstorm` |
-| **Planner** | 6-step structured decisions + auto-injected frameworks (first principles, pre-mortem, etc.) | `python3 -m planner` |
-| **Assistant** | Memos with #thread tags, work thread tracking, daily/weekly briefs, reminders | `python3 -m assistant` |
+| **Planner** | 6-step structured decisions + auto-generate Feishu docs (Brief / Calendar / Spec, 10 types) | `python3 -m planner` |
+| **Assistant** | Memos, #thread tracking, daily/weekly briefs, reminders, web research | `python3 -m assistant` |
 | **Creative Prompt** | Generate prompts for Seedance / MidJourney / Sora and other AI tools | `python3 -m creative` |
 | **Sentiment Monitor** | Collect social media data from 15 platforms (Weibo, Douyin, Xiaohongshu, TikTok, etc.) | `python3 -m sentiment` |
 | **News Digest** | Multi-source news aggregation + AI analysis, daily push | `python3 -m newsbot` |
