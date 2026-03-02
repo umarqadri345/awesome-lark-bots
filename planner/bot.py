@@ -45,6 +45,8 @@ from planner.prompts import (
     detect_doc_category, build_doc_menu, FOLLOWUP_SYSTEM,
 )
 from memo.projects import register_project
+from pitch.agencies import parse_agency_spec
+from pitch.run import run_pitch
 
 _VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
 _ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
@@ -82,6 +84,16 @@ _MODE_PREFIXES = (
     "执行模式 ", "执行模式：", "执行模式:",
 )
 
+_PITCH_PREFIXES = (
+    "比稿：", "比稿:", "比稿 ", "pitch：", "pitch:", "pitch ",
+)
+
+
+def _is_pitch_request(text: str) -> bool:
+    """检测是否是比稿请求。"""
+    t = text.strip().lower()
+    return any(t.startswith(p.lower()) for p in _PITCH_PREFIXES)
+
 def _welcome() -> dict:
     return welcome_card(
         "规划机器人",
@@ -95,7 +107,7 @@ def _welcome() -> dict:
             "规划：Q3 用户增长策略",
             "快速模式：下周产品发布计划",
         ],
-        hints=["日常问题直接发，复杂决策加「规划：」前缀", "发送「帮助」查看完整指南"],
+        hints=["日常问题直接发，复杂决策加「规划：」前缀", "营销比稿发「比稿：话题」", "发送「帮助」查看完整指南"],
     )
 
 
@@ -114,7 +126,7 @@ def _help() -> dict:
          "**方案模式** 仅生成 3 个方案\n"
          "**执行模式** 仅生成执行计划\n"
          "用法：快速模式：下周产品发布计划"),
-        ("💬 规划追问",
+        ("💬 追问",
          "规划完成后可以直接追问，1 小时内有效：\n"
          "> 第三个方案能展开说说吗？\n"
          "> 如果预算减半怎么调整？\n"
@@ -133,7 +145,14 @@ def _help() -> dict:
          "涉及市场、行业、旅行、技术选型时自动搜索\n"
          "搜索结果整合后作为规划背景材料\n"
          "个人决策类话题不触发搜索"),
-    ], footer="对话秒回 | 规划约 2-4 分钟（含搜索时 +30s）| 追问 1 小时内有效")
+        ("🏆 Agency 比稿（营销专属）",
+         "做营销方案时，想要多个风格的方案PK？\n"
+         "发「比稿：话题」启动多 Agency 比稿模式：\n"
+         "> 比稿：618 大促营销方案\n"
+         "> 比稿 2组 体验派 增长派：新品上市\n"
+         "默认 3 个 Agency（体验派/增长派/品牌派），可自定义\n"
+         "流程：独立提案 → 交叉点评 → 裁决融合，约 3-4 分钟"),
+    ], footer="对话秒回 | 规划约 2-4 分钟 | 追问 1 小时内有效")
 
 
 def _extract_text(content: str) -> str:
@@ -567,11 +586,13 @@ def _clear_planning_context(user_key: str) -> None:
 
 
 def _is_explicit_new_planning(text: str) -> bool:
-    """判断是否是显式的新规划请求（带前缀）。"""
+    """判断是否是显式的新规划请求（带前缀），包括比稿。"""
     t = text.strip()
     for prefix in _PLANNING_PREFIXES:
         if t.lower().startswith(prefix) or t.startswith(prefix):
             return True
+    if _is_pitch_request(t):
+        return True
     return False
 
 
@@ -761,6 +782,96 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 except Exception as e:
                     _log(f"对话回复异常: {e}")
                     reply_message(mid, "抱歉，出了点问题，稍后再试。")
+                return
+
+            # ── 比稿模式 ──
+            if _is_pitch_request(text):
+                agencies, pitch_topic = parse_agency_spec(text)
+                _clear_planning_context(user_key)
+                if not pitch_topic:
+                    _send_msg(uid, mid, "请提供比稿课题，例如：比稿：618 大促营销方案")
+                    return
+                with _running_lock:
+                    if user_key in _running_sessions:
+                        reply_card(mid, progress_card(
+                            "任务进行中",
+                            f"当前主题：**{_running_sessions[user_key][:40]}**\n\n请等当前任务结束后再发起新的。",
+                            color="orange",
+                        ))
+                        return
+                    _running_sessions[user_key] = pitch_topic
+                agency_names = ", ".join(f"{a.emoji} {a.name}" for a in agencies)
+                reply_card(mid, progress_card(
+                    "🏆 正在启动 Agency 比稿",
+                    f"**课题：**{pitch_topic[:200]}\n"
+                    f"**参赛 Agency：**{agency_names}\n\n"
+                    f"比稿过程将实时推送到飞书群，约 3-4 分钟。",
+                    color="purple",
+                ))
+                _log(f"启动比稿: topic={pitch_topic[:80]!r} agencies={[a.name for a in agencies]}")
+                try:
+                    path, planning_outputs, pitch_data = run_pitch(
+                        topic=pitch_topic, context="", agencies=agencies,
+                    )
+                    done_card = result_card(
+                        "🏆 比稿完成",
+                        fields=[("课题", pitch_topic[:100]), ("Agency", agency_names)],
+                        next_actions=["回复数字生成文档", "直接追问比稿内容", "发「结束讨论」退出追问模式"],
+                    )
+                    if uid:
+                        send_card_to_user(uid, done_card)
+                    else:
+                        reply_card(mid, done_card)
+
+                    short_title = _generate_short_title(pitch_topic)
+                    category = "marketing"
+                    with _pending_docs_lock:
+                        _pending_docs[user_key] = {
+                            "topic": pitch_topic,
+                            "short_title": short_title,
+                            "outputs": planning_outputs,
+                            "path": path,
+                            "open_id": uid,
+                            "category": category,
+                            "doc_menu": build_doc_menu(category),
+                            "ts": time.time(),
+                        }
+                    with _planning_contexts_lock:
+                        _planning_contexts[user_key] = {
+                            "topic": pitch_topic,
+                            "outputs": planning_outputs,
+                            "history": [],
+                            "open_id": uid,
+                            "session_path": path,
+                            "ts": time.time(),
+                        }
+
+                    time.sleep(1)
+                    menu_card = _doc_menu_card(category)
+                    if uid:
+                        send_card_to_user(uid, menu_card)
+                    else:
+                        reply_card(mid, menu_card)
+
+                    try:
+                        from core.events import emit as _emit_event
+                        _emit_event("planner", "pitch_completed",
+                                    f"比稿完成: {pitch_topic[:50]}",
+                                    user_id=uid or "",
+                                    meta={"topic": pitch_topic[:100], "path": str(path)})
+                    except Exception:
+                        pass
+                    _log(f"比稿完成: {path}")
+                except Exception as e:
+                    _log(f"比稿异常: {e}\n{traceback.format_exc()}")
+                    err = error_card("比稿执行出错", "内部错误，请稍后重试", suggestions=["重新发送比稿课题再试一次"])
+                    if uid:
+                        send_card_to_user(uid, err)
+                    else:
+                        reply_card(mid, err)
+                finally:
+                    with _running_lock:
+                        _running_sessions.pop(user_key, None)
                 return
 
             # ── 新规划：清除旧上下文 ──

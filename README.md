@@ -152,10 +152,11 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 
 ### 2. 规划机器人 (`planner/`)
 
-给机器人发消息即可启动理性规划。支持两种交互模式：
+给机器人发消息即可启动理性规划。支持三种交互模式：
 
 - **直接聊** → 像朋友一样讨论，给判断、给方案、指出盲区
 - **发「规划：话题」** → 启动六步结构化深度拆解，完成后可生成飞书文档
+- **发「比稿：话题」** → 启动 Agency 比稿模式（营销专属），多风格方案 PK
 - 涉及市场/行业/旅行/技术时**自动联网搜索**补充真实数据（约 +30s）
 
 **五种规划模式：**
@@ -182,9 +183,19 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 
 **切换模式：** 在消息前加模式名，如 `快速模式：下周产品发布计划`
 
+**Agency 比稿（营销专属）：**
+```
+比稿：618 大促营销方案                     → 默认 3 组 Agency（体验派/增长派/品牌派）
+比稿 2组 体验派 增长派：新品上市           → 自定义组队
+```
+
+流程：Brief 结构化 → 联网搜索 → 并行独立提案 → 交叉点评 → 裁决融合（约 3-4 分钟）。
+比稿完成后同样支持文档生成和追问。
+
 **也可 CLI 运行：**
 ```bash
 python3 -m planner.run --topic "Q3 用户增长策略" --mode "快速模式"
+python3 -m pitch --topic "618 大促营销方案"
 ```
 
 ### 3. 助手机器人 (`assistant/`)
@@ -366,10 +377,16 @@ awesome-lark-bots/
 │   └── __main__.py           #   启动入口：python3 -m brainstorm
 │
 ├── planner/                  # 规划机器人
-│   ├── bot.py                #   飞书长连接入口（对话+规划+文档交付）
+│   ├── bot.py                #   飞书长连接入口（对话+规划+比稿+文档交付）
 │   ├── run.py                #   主流程引擎（六步规划 + 文档生成）
 │   ├── prompts.py            #   规划提示词 + 10 种文档模板
 │   └── __main__.py           #   启动入口：python3 -m planner
+│
+├── pitch/                    # Agency 比稿模块（规划机器人营销专属功能）
+│   ├── agencies.py           #   Agency 定义 + 组队解析（体验派/增长派/品牌派）
+│   ├── run.py                #   比稿主流程（Brief→并行提案→交叉点评→裁决融合）
+│   ├── prompts.py            #   比稿提示词库（Agency 人设/提案/点评/裁决）
+│   └── __main__.py           #   CLI：python3 -m pitch --topic "课题"
 │
 ├── assistant/                # 助手机器人
 │   ├── bot.py                #   飞书长连接入口（备忘+日程+研究+对话）
@@ -607,7 +624,7 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 |-----|-------------|---------|
 | **Content Assistant** ⚗️ | End-to-end content pipeline: topic → brainstorm → plan → create → store → publish | `python3 -m conductor` |
 | **Brainstorm** | 5 AI personas simulate a real team discussion in 4 rounds | `python3 -m brainstorm` |
-| **Planner** | 6-step decisions + auto web research + Feishu docs/sheets (Brief / Calendar / Spec, 10 types) | `python3 -m planner` |
+| **Planner** | 6-step decisions + auto web research + Feishu docs/sheets (10 types) + Agency Pitch mode (parallel proposals → cross-critique → verdict) | `python3 -m planner` |
 | **Assistant** | Memos + threads, project management (Feishu Bitable with 6 structured tables), finance tracking (auto-synced to Bitable), web research, daily/weekly/monthly reports | `python3 -m assistant` |
 | **Creative Prompt** | Generate prompts for AI tools + exec brief mode with Bitable asset tracker | `python3 -m creative` |
 | **Sentiment Monitor** | 3-phase pipeline: 15 social platforms + Web Search (Tavily/DDG) for ~1000 posts | `python3 -m sentiment` |
