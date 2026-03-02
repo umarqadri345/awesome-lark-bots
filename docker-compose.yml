@@ -22,6 +22,8 @@ services:
     command: python3 -m assistant
     env_file: .env
     restart: always
+    environment:
+      - TZ=Asia/Shanghai   # 定时任务 08:00/18:00 按中国时间执行
     volumes:
       - ./data:/app/data
       - ./runs:/app/runs

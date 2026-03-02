@@ -38,7 +38,10 @@ except ImportError:
 from core.feishu_webhook import send_planner_text as send_text, send_planner_card
 from core.llm import chat_completion
 from core.utils import load_context, run_timestamp, save_session, truncate_for_display
-from planner.prompts import REFINE_BRIEF_SYSTEM, STEP_PROMPTS, MODES, MODE_DESCRIPTIONS, PLANNER_SYSTEM, DOC_TYPES
+from planner.prompts import (
+    REFINE_BRIEF_SYSTEM, STEP_PROMPTS, MODES, MODE_DESCRIPTIONS, PLANNER_SYSTEM, DOC_TYPES,
+    SEARCH_JUDGE_SYSTEM, SEARCH_CONTEXT_SYSTEM,
+)
 from skills import load_context as load_skill_context
 
 FEISHU_INTERVAL = 1.0
@@ -93,6 +96,99 @@ def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tup
     except Exception:
         pass
     return chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+
+
+def _judge_search_need(topic: str, context: str) -> dict:
+    """让 LLM 判断话题是否需要联网搜索，返回 {need_search, reason, queries}。"""
+    import json as _json
+    user_msg = f"规划话题：{topic}"
+    if context:
+        user_msg += f"\n\n背景材料摘要：{context[:1000]}"
+    try:
+        raw = chat_completion(
+            provider=PROVIDER, system=SEARCH_JUDGE_SYSTEM, user=user_msg,
+        ).strip()
+        raw = raw.strip("`").removeprefix("json").strip()
+        return _json.loads(raw)
+    except Exception as e:
+        print(f"[搜索判断] 解析失败: {e}", flush=True)
+        return {"need_search": False, "reason": "判断失败", "queries": []}
+
+
+def _execute_searches(queries: list[str], max_results: int = 4) -> str:
+    """执行搜索并拼接原始结果文本。"""
+    from research.search import web_search
+    all_results: list[str] = []
+    for q in queries[:3]:
+        print(f"  🔍 搜索: {q}", flush=True)
+        results = web_search(q, max_results=max_results)
+        if results:
+            parts = [f"[查询] {q}"]
+            for r in results:
+                title = r.get("title", "")
+                content = r.get("content", "")
+                url = r.get("url", "")
+                parts.append(f"- {title}: {content}" + (f" ({url})" if url else ""))
+            all_results.append("\n".join(parts))
+    return "\n\n".join(all_results)
+
+
+def _synthesize_search(topic: str, raw_results: str) -> str:
+    """用 LLM 将搜索原始结果浓缩为规划可用的背景材料。"""
+    if not raw_results.strip():
+        return ""
+    user_msg = f"规划话题：{topic}\n\n搜索结果：\n{raw_results[:6000]}"
+    try:
+        return chat_completion(
+            provider=PROVIDER, system=SEARCH_CONTEXT_SYSTEM, user=user_msg,
+        ).strip()
+    except Exception as e:
+        print(f"[搜索整合] 失败: {e}", flush=True)
+        return ""
+
+
+def research_for_planning(topic: str, context: str) -> str:
+    """规划前的信息补充：判断 → 搜索 → 整合。返回补充材料或空字符串。"""
+    print("[信息补充] 判断是否需要联网搜索…", flush=True)
+    judgment = _judge_search_need(topic, context)
+
+    if not judgment.get("need_search"):
+        reason = judgment.get("reason", "")
+        print(f"[信息补充] 不需要搜索 — {reason}", flush=True)
+        return ""
+
+    queries = judgment.get("queries") or []
+    if not queries:
+        print("[信息补充] 需要搜索但未生成查询词，跳过", flush=True)
+        return ""
+
+    reason = judgment.get("reason", "")
+    print(f"[信息补充] 需要搜索 — {reason}", flush=True)
+    print(f"[信息补充] 查询词: {queries}", flush=True)
+
+    send_planner_card(
+        "🔍 信息补充",
+        f"话题需要实时数据，正在搜索…\n\n"
+        + "\n".join(f"- {q}" for q in queries),
+        color="blue",
+    )
+    time.sleep(FEISHU_INTERVAL)
+
+    raw = _execute_searches(queries)
+    if not raw.strip():
+        print("[信息补充] 搜索无结果", flush=True)
+        return ""
+
+    synthesis = _synthesize_search(topic, raw)
+    if synthesis:
+        print(f"[信息补充] 整合完成 ({len(synthesis)} 字)", flush=True)
+        send_planner_card(
+            "🔍 搜索结果摘要",
+            synthesis[:2000],
+            color="blue",
+        )
+        time.sleep(FEISHU_INTERVAL)
+    return synthesis
 
 
 def detect_mode(text: str) -> str:
@@ -170,6 +266,12 @@ def run_planning(
             context = brief + "\n\n" + context
         else:
             print("[需求结构化] 调用失败，使用原始输入。", flush=True)
+
+    # ── 信息补充（联网搜索）──
+    search_context = research_for_planning(topic, context)
+    if search_context:
+        session_lines.extend(["## 联网搜索补充", "", search_context, "", "---", ""])
+        context = context + "\n\n【联网搜索补充材料】\n" + search_context
 
     print(f"[规划开始] 模式: {mode}", flush=True)
     print(f"  主题: {topic[:120]}{'...' if len(topic) > 120 else ''}", flush=True)

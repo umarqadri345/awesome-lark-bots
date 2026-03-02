@@ -29,10 +29,10 @@
 |--------|-----------|---------------|----------|
 | **自媒体助手** ⚗️ | 自媒体全流程编排：输入主题 → 自动脑暴+规划+创作+存储+定时发布 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
 | **脑暴机器人** | 5 个 AI 角色模拟真人团队讨论，四轮产出创意方案 | 发消息：`咖啡品牌 × 音乐节跨界联动` | `python3 -m brainstorm` |
-| **规划机器人** | 六步结构化决策 + 自动生成飞书文档（Brief / 日历 / 时间线 / Spec 等 10 种） | 发消息：`规划：Q3 用户增长策略` | `python3 -m planner` |
+| **规划机器人** | 六步结构化决策 + 自动联网搜索 + 飞书文档/表格（10 种文档类型） | 发消息：`规划：Q3 用户增长策略` | `python3 -m planner` |
 | **助手机器人** | 备忘+线程、项目管理（飞书表格）、财务（记账/预算/目标）、联网研究、日/周/月报 | 发消息：`创建项目 Q2营销` / `记账 午餐 35` | `python3 -m assistant` |
 | **创意 Prompt** | 生成 Seedance / Nano Banana 等 AI 工具可用的素材 prompt | 发消息：`春日樱花的抖音预告` | `python3 -m creative` |
-| **舆情监控** | 从微博/抖音/小红书等 15 个平台采集社媒数据 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
+| **舆情监控** | 15 个社媒平台 + Web Search（Tavily/DDG）采集，三阶段补量 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
 | **早知天下事** | 多源新闻聚合 + AI 分析，每日推送新闻简报 | 发消息：`新闻` / `科技新闻` | `python3 -m newsbot` |
 
 > ⚗️ **自媒体助手**目前处于探索阶段——基本框架已搭好，能跑通"选题→脑暴→规划→创作→存储"全流程，但在内容自动生成的质量把控和自媒体平台自动发布方面，还有很多需要探索和优化的空间。我们非常欢迎社区一起来完善这个模块。
@@ -156,6 +156,7 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 
 - **直接聊** → 像朋友一样讨论，给判断、给方案、指出盲区
 - **发「规划：话题」** → 启动六步结构化深度拆解，完成后可生成飞书文档
+- 涉及市场/行业/旅行/技术时**自动联网搜索**补充真实数据（约 +30s）
 
 **五种规划模式：**
 | 模式 | 包含步骤 | 适合场景 |
@@ -294,7 +295,7 @@ python3 -m conductor.cli --detail abc123  # 查看内容详情
 
 ### 6. 舆情监控机器人 (`sentiment/`)
 
-从社交媒体平台采集数据，生成结构化分析材料。
+三阶段采集流水线，从社交媒体到全网搜索，生成结构化分析材料。
 
 **快捷报告（一键使用）：**
 ```
@@ -310,10 +311,16 @@ python3 -m conductor.cli --detail abc123  # 查看内容详情
 咖啡品牌 @抖音 @小红书 14天 50条
 ```
 
-**支持 15 个平台：**
+**三阶段采集流水线：**
+1. **Phase 1** — JOA 统一搜索（全平台快速扫描）
+2. **Phase 2** — 分平台深度搜索（微博/抖音/小红书等 MCP 采集器）
+3. **Phase 3** — Web Search 补量（Tavily API + DuckDuckGo 翻页，补到 ~1000 条）
+
+**支持 15+ 个平台：**
 - 国内社媒：微博、抖音、小红书、B站、快手、知乎、头条、微信
 - 海外社媒：TikTok、YouTube、Twitter、Instagram、Facebook
 - 电商平台：淘宝、拼多多
+- 全网搜索：Tavily、DuckDuckGo（自动识别来源平台）
 
 **可选 AI 分析：** 在指令末尾加 `+分析`，同时生成 AI 分析报告
 
@@ -386,9 +393,10 @@ awesome-lark-bots/
 │       ├── engager.py        #     互动：监控评论+自动回复
 │       └── reviewer.py       #     复盘：效果分析+改进建议
 │
-├── sentiment/                # 舆情监控机器人
+├── sentiment/                # 舆情监控机器人（三阶段采集）
 │   ├── bot.py                #   飞书长连接入口（指令解析+引导对话）
 │   ├── runner.py             #   采集流程编排（采集→统计→导出→上传）
+│   ├── core/collector.py     #   三阶段采集：JOA + 分平台 + Web Search（Tavily/DDG）
 │   ├── exporter.py           #   数据导出（JSON + Markdown）
 │   ├── feishu_api.py         #   飞书 API（舆情机器人专用）
 │   ├── github_client.py      #   GitHub 上传
@@ -590,10 +598,10 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 |-----|-------------|---------|
 | **Content Assistant** ⚗️ | End-to-end content pipeline: topic → brainstorm → plan → create → store → publish | `python3 -m conductor` |
 | **Brainstorm** | 5 AI personas simulate a real team discussion in 4 rounds | `python3 -m brainstorm` |
-| **Planner** | 6-step structured decisions + auto-generate Feishu docs (Brief / Calendar / Spec, 10 types) | `python3 -m planner` |
+| **Planner** | 6-step decisions + auto web research + Feishu docs/sheets (Brief / Calendar / Spec, 10 types) | `python3 -m planner` |
 | **Assistant** | Memos + threads, project management (Feishu Sheets), finance (expenses/budgets/goals), web research, daily/weekly/monthly reports | `python3 -m assistant` |
 | **Creative Prompt** | Generate prompts for Seedance / MidJourney / Sora and other AI tools | `python3 -m creative` |
-| **Sentiment Monitor** | Collect social media data from 15 platforms (Weibo, Douyin, Xiaohongshu, TikTok, etc.) | `python3 -m sentiment` |
+| **Sentiment Monitor** | 3-phase pipeline: 15 social platforms + Web Search (Tavily/DDG) for ~1000 posts | `python3 -m sentiment` |
 | **News Digest** | Multi-source news aggregation + AI analysis, daily push | `python3 -m newsbot` |
 
 > ⚗️ **Content Assistant** is in active exploration — the basic framework works end-to-end, but content quality control and automated publishing to social media platforms are still areas we're actively improving. Community contributions are very welcome!

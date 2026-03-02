@@ -17,6 +17,9 @@ from sentiment.config.settings import (
     JOA_TOKEN, BEIJING, REQ_DELAY, WORKERS,
     UNIFIED_MAX_PAGES, PLATFORM_MAX_PAGES, PLATFORM_PAGES_DEEP,
     BROWSER_MCP_HTTP_URL, CACHE_DIR, log,
+    TAVILY_API_KEY, WEB_SEARCH_ENABLED, WEB_SEARCH_TARGET,
+    WEB_SEARCH_TAVILY_PER_QUERY, WEB_SEARCH_DDG_MAX_PAGES,
+    WEB_SEARCH_QUERY_VARIANTS_CN, WEB_SEARCH_QUERY_VARIANTS_EN,
 )
 from sentiment.core.joa_client import joa_request
 from sentiment.core.platforms import (
@@ -354,6 +357,176 @@ PLATFORM_SEARCH_DISPATCH = {
 PLATFORMS_DEEP = list(PLATFORM_SEARCH_DISPATCH.keys())
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Web Search（Tavily + DuckDuckGo 翻页补量）
+# ---------------------------------------------------------------------------
+
+_DDG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+}
+
+
+def _tavily_search_bulk(query: str, max_results: int = 20) -> list[dict]:
+    """Tavily API 搜索，返回标准 post 格式列表。"""
+    if not TAVILY_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "max_results": min(max_results, 20),
+                "include_answer": False,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        posts = []
+        for r in data.get("results", []):
+            url = r.get("url", "")
+            posts.append({
+                "platform": _infer_platform_from_web_url(url),
+                "title": (r.get("title") or "").strip(),
+                "content": (r.get("content") or "").strip(),
+                "url": url,
+                "source": "WEB_TAVILY",
+            })
+        return posts
+    except Exception as e:
+        log.warning("Tavily bulk search failed [%s]: %s", query[:40], e)
+        return []
+
+
+def _ddg_search_pages(query: str, max_pages: int = 30) -> list[dict]:
+    """DuckDuckGo HTML 搜索，多页翻页获取大量结果。"""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log.warning("BeautifulSoup 未安装，跳过 DuckDuckGo 搜索")
+        return []
+
+    all_posts: list[dict] = []
+    for page in range(max_pages):
+        offset = page * 30
+        params = {"q": query}
+        if offset > 0:
+            params["s"] = str(offset)
+            params["dc"] = str(offset + 1)
+        try:
+            resp = requests.get(
+                "https://html.duckduckgo.com/html/",
+                params=params,
+                headers=_DDG_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            results = soup.select(".result")
+            if not results:
+                break
+            for item in results:
+                title_tag = item.select_one(".result__a")
+                snippet_tag = item.select_one(".result__snippet")
+                if not title_tag:
+                    continue
+                url = title_tag.get("href", "")
+                if url.startswith("//duckduckgo.com/l/"):
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                    url = parsed.get("uddg", [url])[0]
+                all_posts.append({
+                    "platform": _infer_platform_from_web_url(url),
+                    "title": title_tag.get_text(strip=True),
+                    "content": snippet_tag.get_text(strip=True) if snippet_tag else "",
+                    "url": url,
+                    "source": "WEB_DDG",
+                })
+            time.sleep(REQ_DELAY * 2)
+        except Exception as e:
+            log.warning("DDG page %d failed [%s]: %s", page, query[:30], e)
+            break
+    return all_posts
+
+
+def _infer_platform_from_web_url(url: str) -> str:
+    """从 URL 推断平台名，未知则标「网页」。"""
+    from sentiment.config.settings import URL_DOMAIN_TO_PLATFORM
+    url_lower = (url or "").lower()
+    for domain, plat_name in URL_DOMAIN_TO_PLATFORM:
+        if domain in url_lower:
+            return plat_name
+    return "网页"
+
+
+def _is_chinese_keywords(keywords: list[str]) -> bool:
+    import re
+    for kw in keywords:
+        if re.search(r'[\u4e00-\u9fff]', kw):
+            return True
+    return False
+
+
+def web_search_collect(keywords: list[str], target: int = 1000) -> list[dict]:
+    """Web 搜索采集：Tavily 出质量，DuckDuckGo 翻页出量。
+
+    对每个关键词 × 查询变体组合进行搜索，汇总后去重，目标约 target 条。
+    """
+    if not WEB_SEARCH_ENABLED:
+        return []
+    if not TAVILY_API_KEY:
+        log.info("Web Search: TAVILY_API_KEY 未设置，仅用 DuckDuckGo")
+
+    is_cn = _is_chinese_keywords(keywords)
+    variants = WEB_SEARCH_QUERY_VARIANTS_CN if is_cn else WEB_SEARCH_QUERY_VARIANTS_EN
+
+    all_posts: list[dict] = []
+    queries_done: set[str] = set()
+
+    per_kw_target = max(target // max(len(keywords), 1), 100)
+    ddg_pages_per_query = min(
+        WEB_SEARCH_DDG_MAX_PAGES,
+        max(per_kw_target // (30 * max(len(variants), 1)), 3),
+    )
+
+    for kw in keywords:
+        if len(all_posts) >= target * 1.2:
+            break
+        for variant in variants:
+            if len(all_posts) >= target * 1.2:
+                break
+            query = f"{kw} {variant}".strip() if variant else kw
+            if query in queries_done:
+                continue
+            queries_done.add(query)
+
+            log.info("  web_search [%s]", query)
+
+            if TAVILY_API_KEY:
+                tavily_results = _tavily_search_bulk(query, WEB_SEARCH_TAVILY_PER_QUERY)
+                if tavily_results:
+                    all_posts.extend(tavily_results)
+                    log.info("    tavily → %d", len(tavily_results))
+
+            ddg_results = _ddg_search_pages(query, ddg_pages_per_query)
+            if ddg_results:
+                all_posts.extend(ddg_results)
+                log.info("    ddg → %d", len(ddg_results))
+
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for p in all_posts:
+        key = p.get("url") or p.get("content", "")[:80]
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(p)
+    if len(deduped) > target:
+        deduped = deduped[:target]
+    log.info("Web Search 完成: %d 条（去重后）", len(deduped))
+    return deduped
+
+
 def _per_platform(platform, kw, start_dt, end_dt):
     fn = PLATFORM_SEARCH_DISPATCH.get(platform)
     if fn:
@@ -433,7 +606,11 @@ def _mock_posts():
 def collect_posts(profile: dict, browser_posts_path: str | None = None,
                    platforms: list[str] | None = None) -> list[dict]:
     """
-    完整采集流程：统一搜索 + 分平台 + Browser MCP 补充。
+    完整采集流程：统一搜索 + 分平台 + Browser MCP + Web Search。
+
+    Phase 1: JOA 统一搜索（全平台）
+    Phase 2: 分平台深度搜索（微博/抖音/小红书等）
+    Phase 3: Web Search（Tavily + DuckDuckGo 翻页，补量到 ~1000 条）
 
     Args:
         profile: 报告配置 dict
@@ -525,6 +702,20 @@ def collect_posts(profile: dict, browser_posts_path: str | None = None,
             posts.extend(extra)
             posts = dedup_posts(posts)
             log.info("Browser MCP HTTP 合并: +%d 条，去重后共 %d 条", len(extra), len(posts))
+
+    # Phase 3: Web Search — Tavily + DuckDuckGo 补量
+    if WEB_SEARCH_ENABLED and (TAVILY_API_KEY or True):
+        web_target = profile.get("web_search_target", WEB_SEARCH_TARGET)
+        remaining = max(max_posts - len(posts), 0)
+        actual_target = min(web_target, remaining) if remaining > 0 else web_target
+        if actual_target > 0:
+            log.info("Phase 3: Web Search (%d 关键词, 目标 %d 条)...",
+                     len(keywords), actual_target)
+            web_posts = web_search_collect(keywords, target=actual_target)
+            if web_posts:
+                posts.extend(web_posts)
+                posts = dedup_posts(posts)
+                log.info("Phase 3 完成: +%d 条, 去重后共 %d 条", len(web_posts), len(posts))
 
     if len(posts) > max_posts:
         posts = posts[:max_posts]

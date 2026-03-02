@@ -269,6 +269,15 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_card(mid, _help())
                 return
 
+            # 打招呼 / 问「你能做什么」→ 直接回欢迎卡片（否则会走聊天只回文字）
+            _greeting = t.lower().strip()
+            if _greeting in ("hi", "hello", "你好", "嗨", "在吗", "在么", "hey"):
+                reply_card(mid, _welcome())
+                return
+            if _greeting in ("你可以做什么", "你能做什么", "你能干嘛", "有什么功能", "介绍下自己", "你是谁"):
+                reply_card(mid, _welcome())
+                return
+
             # ── 关键词快速匹配：备忘 ──
             prefixes = (
                 "备忘 ", "备忘：", "备忘:", "记一下 ", "记一下：", "记一下:",

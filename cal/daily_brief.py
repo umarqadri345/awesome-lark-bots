@@ -426,6 +426,11 @@ def run_daily_brief(is_morning: bool = True) -> bool:
     from cal.push_target import get_push_target_open_id
     open_id = get_push_target_open_id()
     if not open_id:
+        print(
+            "[DailyBrief] 未推送：未配置推送对象。请在 .env 中设置 FEISHU_PUSH_OPEN_ID，或先在飞书里给助理发一条消息以自动记录。",
+            file=sys.stderr,
+            flush=True,
+        )
         return False
 
     from cal.aggregator import aggregate_for_date
@@ -457,6 +462,7 @@ def run_daily_brief(is_morning: bool = True) -> bool:
         if len(brief) > 4000:
             brief = brief[:3997] + "..."
         send_message_to_user(open_id, brief)
+        print(f"[DailyBrief] 已推送 {'晨报' if is_morning else '收尾'} -> {date_str}", file=sys.stderr, flush=True)
         return True
     except Exception as e:
         print(f"[DailyBrief] 生成或推送失败: {e}", file=sys.stderr, flush=True)

@@ -37,6 +37,7 @@ FEISHU_WEBHOOK_URL = os.getenv("SENTIMENT_FEISHU_WEBHOOK", "") or os.getenv("FEI
 JOA_TOKEN = os.getenv("JOA_TOKEN", "")
 JOA_BASE = os.getenv("JOA_BASE_URL", "https://api.justoneapi.com")
 BROWSER_MCP_HTTP_URL = os.getenv("BROWSER_MCP_HTTP_URL", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # GitHub 数据存储
@@ -65,6 +66,17 @@ TARGET_KUAISHOU = 450
 REQ_DELAY = 0.4
 WORKERS = 3
 
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+WEB_SEARCH_TARGET = int(os.getenv("WEB_SEARCH_TARGET", "1000"))
+WEB_SEARCH_TAVILY_PER_QUERY = 20
+WEB_SEARCH_DDG_MAX_PAGES = 30
+WEB_SEARCH_QUERY_VARIANTS_CN = [
+    "", "评价", "口碑", "体验", "讨论", "怎么样", "测评", "吐槽",
+]
+WEB_SEARCH_QUERY_VARIANTS_EN = [
+    "", "review", "experience", "discussion", "opinion",
+]
+
 # ---------------------------------------------------------------------------
 # AI 分析参数
 # ---------------------------------------------------------------------------
@@ -84,6 +96,7 @@ PLATFORM_CN = {
     "TIKTOK": "TikTok", "YOUTUBE": "YouTube",
     "TWITTER": "Twitter/X", "INSTAGRAM": "Instagram", "FACEBOOK": "Facebook",
     "TAOBAO": "淘宝", "PINDUODUO": "拼多多",
+    "WEB_TAVILY": "网页", "WEB_DDG": "网页", "WEB": "网页",
     "微博": "微博", "抖音": "抖音", "小红书": "小红书",
     "B站": "B站", "快手": "快手", "知乎": "知乎", "头条": "头条",
     "微信公众号": "微信公众号", "TikTok": "TikTok", "YouTube": "YouTube",
