@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-创意 Prompt 机器人 —— 生成 AI 素材制作可用的 prompt。
+素材Bot —— 生成 AI 素材 prompt，并支持落地执行和需求管理。
 =====================================================
 
 这是什么？
@@ -139,7 +139,7 @@ def _format_single_shot_card(raw: str, brand_name: str) -> dict:
         sections.append({"text": cn_prompt.strip()})
     else:
         sections.append({"text": raw.strip()})
-        return _card("AI 素材 Prompt", sections, color="blue")
+        return _card("素材Bot · Prompt", sections, color="blue")
 
     if en_prompt:
         sections.append({"divider": True})
@@ -152,7 +152,7 @@ def _format_single_shot_card(raw: str, brand_name: str) -> dict:
     sections.append({"divider": True})
     sections.append({"note": f"品牌: {brand_name}  ·  「改一下：xxx」调整  ·  点击按钮或发「安排制作」落地执行"})
 
-    card = _card("AI 素材 Prompt · 单镜头", sections, color="blue")
+    card = _card("素材Bot · 单镜头 Prompt", sections, color="blue")
     card["elements"].insert(-1, {
         "tag": "action",
         "actions": [{
@@ -193,7 +193,7 @@ def _format_storyboard_card(raw: str, brand_name: str) -> dict:
         "点击按钮或发「安排制作」落地执行"
     )})
 
-    card = _card(f"AI 素材 Prompt · {shot_count} 镜分镜", sections, color="purple")
+    card = _card(f"素材Bot · {shot_count} 镜分镜 Prompt", sections, color="purple")
     card["elements"].insert(-1, {
         "tag": "action",
         "actions": [{
@@ -302,10 +302,11 @@ def _welcome_card() -> dict:
     profiles = list_brand_profiles()
     brand_list = "、".join(p["name"] for p in profiles) if profiles else "通用模式"
 
-    return _card("Hi! 我是 AI 素材 Prompt 助手", [
+    return _card("Hi! 我是素材Bot", [
         {"text": (
-            "直接告诉我你想要什么素材，我来帮你生成 "
-            "**Seedance / Nano Banana** 等 AI 工具可以直接使用的 prompt。"
+            "告诉我你想要什么素材，我来帮你生成 "
+            "**Seedance / Nano Banana** 等 AI 工具可直接使用的 prompt。\n"
+            "概念满意后，还能一键**安排制作**，生成执行Brief并提交到素材管理表。"
         )},
         {"text": (
             "**直接出 prompt：**\n"
@@ -313,8 +314,10 @@ def _welcome_card() -> dict:
             "> 咖啡师拉花特写，小红书15秒\n\n"
             "**想先讨论方向？**\n"
             "> 聊聊：我想做一个关于春日出游的视频\n"
-            "> 你觉得这个用什么风格好？\n"
-            "> （聊完发「**生成**」出正式 prompt）"
+            "> （聊完发「**生成**」出正式 prompt）\n\n"
+            "**落地执行？**\n"
+            "> prompt 生成后点击「**🎬 安排制作**」按钮\n"
+            "> 或直接发「**安排制作**」→ 讨论执行细节 → 生成Brief文档 → 提交需求"
         )},
         {"divider": True},
         {"text": (
@@ -1362,8 +1365,10 @@ def _run_client(app_id: str, app_secret: str) -> None:
 
     card_handler = None
     try:
-        card_handler = lark.CardActionHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY).event_handler(
-            _handle_card_action
+        card_handler = lark.CardActionHandler.builder(
+            _ENCRYPT_KEY, _VERIFY_TOKEN,
+        ).register(
+            _handle_card_action,
         ).build()
         _log("卡片操作处理器已注册")
     except Exception as e:
@@ -1403,10 +1408,10 @@ def main():
     os.environ["FEISHU_APP_SECRET"] = app_secret
 
     from creative.knowledge import CORE_SYSTEM_PROMPT
-    _log("创意 Prompt 机器人启动")
+    _log("素材Bot启动")
     _log(f"代码验证: has_example={'<example>' in CORE_SYSTEM_PROMPT}, has_chat_triggers={'帮我想' in str(_CHAT_TRIGGERS)}")
     print("=" * 60)
-    print("AIlarkteams 创意 Prompt 机器人（长连接模式）")
+    print("AIlarkteams 素材Bot（长连接模式）")
     print()
     print("使用方式：在飞书上给机器人发消息，描述想要的素材即可。")
     print("  例：春日花海中一对朋友漫步的抖音预告")

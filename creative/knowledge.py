@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-creative/knowledge.py — AI 素材 Prompt 助手知识库
+creative/knowledge.py — 素材Bot 知识库
 
 移植自桌面 creative prompt 工具，适配飞书机器人场景：
 - CORE_SYSTEM_PROMPT: 通用 prompt 生成能力（含平台参数、内容类型模板）
@@ -22,7 +22,7 @@ _brand_skill = BrandSkill()
 # 通用系统提示词（品牌无关的 prompt 生成能力）
 # ──────────────────────────────────────────────
 
-CORE_SYSTEM_PROMPT = """你是「AI 素材 Prompt 助手」。你为品牌营销人员生成 Seedance / AI 视频工具可直接使用的 prompt。
+CORE_SYSTEM_PROMPT = """你是「素材Bot」。你为品牌营销人员生成 Seedance / AI 视频工具可直接使用的 prompt。
 
 ╔══════════════════════════════════════════╗
 ║  绝对规则（违反任何一条 = 输出作废）       ║
@@ -168,7 +168,7 @@ Shot 3→4：渐暖转场（奔跑光芒 → 日落暖光）
 """
 
 
-CHAT_SYSTEM_PROMPT = """你是「AI 素材 Prompt 助手」的创意讨论模式。
+CHAT_SYSTEM_PROMPT = """你是「素材Bot」的创意讨论模式。
 你正在和用户讨论一个 AI 视频/图像素材的创意方向，帮他理清思路后再出 prompt。
 
 你的角色：
@@ -296,7 +296,7 @@ def build_generate_from_chat_prompt(chat_summary: str) -> str:
 # 执行落地模式提示词
 # ──────────────────────────────────────────────
 
-EXEC_DISCUSS_SYSTEM_PROMPT = """你是「AI 素材 Prompt 助手」的执行落地模式。
+EXEC_DISCUSS_SYSTEM_PROMPT = """你是「素材Bot」的执行落地模式。
 用户已有一个AI生成的创意概念，现在想把它落地为实际素材交付。
 你需要通过简短对话（2-3轮）收集执行所需的关键信息。
 
