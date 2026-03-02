@@ -179,12 +179,22 @@ def chat(user_message: str, system_prompt: Optional[str] = None) -> str:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_message})
 
-    response = client.chat.completions.create(
-        model=os.environ.get("DEEPSEEK_MODEL", "").strip() or "deepseek-chat",
-        messages=messages,
-        max_tokens=2048,
-        temperature=0.3,
-    )
-    if not response.choices or not response.choices[0].message.content:
-        return ""
-    return response.choices[0].message.content.strip()
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=os.environ.get("DEEPSEEK_MODEL", "").strip() or "deepseek-chat",
+                messages=messages,
+                max_tokens=2048,
+                temperature=0.3,
+            )
+            if not response.choices or not response.choices[0].message.content:
+                return ""
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            raise
+    raise last_err  # type: ignore[misc]

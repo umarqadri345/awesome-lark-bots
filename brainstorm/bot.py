@@ -49,10 +49,16 @@ except ImportError:
 import lark_oapi as lark
 from lark_oapi import EventDispatcherHandler, LogLevel
 
+from collections import OrderedDict
+
 from core.feishu_client import reply_message, reply_card, send_message_to_user, send_card_to_user
 from core.cards import welcome_card, progress_card, result_card, error_card, help_card
+from core.llm import chat_completion
 from brainstorm.run import run_brainstorm
 from core.utils import load_context
+
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
 
 # ── 日志 ─────────────────────────────────────────────────────
 
@@ -112,12 +118,19 @@ def _help() -> dict:
          "→ 交付：讨论总结 + MVP 定义 + Claude Code prompt\n\n"
          "**通用探索** — 生活决策、职业规划、个人目标\n"
          "→ 交付：讨论总结 + 行动方案"),
+        ("脑暴后追问",
+         "脑暴结束后可以继续追问，比如：\n"
+         "> 方向1能展开讲讲吗？\n"
+         "> 这几个方向哪个最容易落地？\n"
+         "> 帮我想想执行计划\n\n"
+         "发「**新主题**」开始新一轮脑暴\n"
+         "发「**退出**」结束追问"),
         ("多行消息", "第一行 = 主题\n其余行 = 背景材料"),
         ("示例",
          "> 帮哆啦A梦造势 它一定能赢过奥特曼\n"
          "> 设计一个让猫主动帮你干活的智能家居\n"
          "> 怎样优雅地在周一早上假装很有精神"),
-    ], footer="脑暴过程约 3-5 分钟，完成后会通知你")
+    ], footer="脑暴过程约 3-5 分钟，完成后可继续追问深入")
 
 
 def _extract_text(content: str) -> str:
@@ -160,12 +173,176 @@ def _parse_brainstorm_input(text: str) -> tuple[str, str]:
     return topic, context
 
 
+# ── 会话状态管理 ─────────────────────────────────────────────
+# 每个用户维护独立会话：保存脑暴结果，支持 follow-up 追问。
+
+_MAX_SESSIONS = 200
+_sessions: OrderedDict[str, dict] = OrderedDict()
+_sessions_lock = threading.Lock()
+
+
+def _get_session(user_key: str) -> dict:
+    with _sessions_lock:
+        if user_key in _sessions:
+            _sessions.move_to_end(user_key)
+            return _sessions[user_key]
+        session = {
+            "mode": "idle",                 # idle | brainstorming | followup
+            "topic": "",                    # 脑暴主题
+            "topic_refined": "",            # 优化后的主题
+            "round_summaries": [],          # 各轮摘要
+            "final_output": "",             # 最终交付内容
+            "session_path": "",             # session 文件路径
+            "followup_history": [],         # follow-up 对话历史
+        }
+        _sessions[user_key] = session
+        while len(_sessions) > _MAX_SESSIONS:
+            _sessions.popitem(last=False)
+        return session
+
+
+def _update_session(user_key: str, **kwargs) -> None:
+    with _sessions_lock:
+        if user_key in _sessions:
+            _sessions[user_key].update(kwargs)
+
+
 # ── 运行中追踪 ───────────────────────────────────────────────
-# 记录每个用户正在进行的脑暴会话，防止同一用户同时发起多场脑暴。
-# key = 用户 open_id, value = 当前脑暴的主题。
 
 _running_sessions: dict[str, str] = {}
 _running_lock = threading.Lock()
+
+
+# ── Follow-up 追问 ───────────────────────────────────────────
+
+_FOLLOWUP_SYSTEM = """你是脑暴追问助手。你刚和用户完成了一场多角色 AI 脑暴讨论，现在用户想就脑暴结果继续深入。
+
+你的角色：
+- 你熟悉整场脑暴的所有讨论内容和最终交付
+- 用户可能想：深入某个方向、追问细节、请你帮忙展开某个创意、对比方向、思考落地方案等
+- 像一个资深创意顾问回答追问，具体、有洞察、不废话
+- 如果用户问到脑暴中没讨论到的东西，基于已有上下文合理延伸
+
+沟通风格：
+- 简洁专业，每次回复 3-8 句话
+- 具体 > 模糊，给可操作的建议
+- 可以主动提出"你可能还想知道…"引导深入
+"""
+
+_MAX_FOLLOWUP_HISTORY = 20
+
+_NEW_TOPIC_TRIGGERS = frozenset({
+    "新主题", "换个主题", "新脑暴", "再来一个", "重新开始",
+    "new topic", "new brainstorm",
+})
+
+_EXIT_FOLLOWUP_TRIGGERS = frozenset({
+    "退出", "结束", "退出追问", "结束追问", "不问了", "算了",
+})
+
+
+def _do_followup(user_key: str, user_input: str) -> str:
+    """基于脑暴结果的 follow-up 对话。"""
+    session = _get_session(user_key)
+
+    history = list(session.get("followup_history", []))
+    history.append({"role": "user", "content": user_input})
+    if len(history) > _MAX_FOLLOWUP_HISTORY:
+        history = history[-_MAX_FOLLOWUP_HISTORY:]
+
+    brainstorm_context = _build_followup_context(session)
+    system = _FOLLOWUP_SYSTEM + "\n\n" + brainstorm_context
+
+    messages = [{"role": "system", "content": system}] + history
+
+    result = chat_completion(
+        provider="deepseek",
+        messages=messages,
+        temperature=0.7,
+    )
+
+    history.append({"role": "assistant", "content": result})
+    _update_session(user_key, followup_history=history)
+    return result
+
+
+def _build_followup_context(session: dict) -> str:
+    """从 session 中提取脑暴结果作为 follow-up 上下文。"""
+    parts = []
+    topic = session.get("topic_refined", "") or session.get("topic", "")
+    if topic:
+        parts.append(f"━━ 脑暴主题 ━━\n{topic[:500]}")
+
+    summaries = session.get("round_summaries", [])
+    if summaries:
+        parts.append("━━ 各轮讨论摘要 ━━")
+        for i, s in enumerate(summaries, 1):
+            parts.append(f"第{i}轮：\n{s[:800]}")
+
+    final = session.get("final_output", "")
+    if final:
+        parts.append(f"━━ 最终交付 ━━\n{final[:3000]}")
+
+    return "\n\n".join(parts) if parts else "（暂无脑暴上下文）"
+
+
+def _final_delivery_card(final_output: str) -> dict:
+    """把最终交付内容作为卡片发到 1-on-1 聊天，用户可以直接看到结果。"""
+    truncated = final_output[:4000]
+    if len(final_output) > 4000:
+        truncated += "\n\n…（内容过长已截断，完整版请查看飞书群）"
+    elements = []
+    elements.append({
+        "tag": "markdown",
+        "content": truncated,
+    })
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": "脑暴最终交付", "tag": "plain_text"},
+            "template": "green",
+        },
+        "elements": elements,
+    }
+
+
+def _done_card_with_followup(topic: str, path: str) -> dict:
+    """脑暴完成卡片：引导用户进入 follow-up 追问。"""
+    return result_card(
+        "脑暴完成",
+        fields=[("主题", topic[:100]), ("会话文件", f"`{path}`")],
+        next_actions=[
+            "直接发消息追问脑暴结果",
+            "「深入方向1」展开某个方向",
+            "「新主题」开始新脑暴",
+            "去飞书群看完整讨论",
+        ],
+    )
+
+
+def _followup_card(content: str) -> dict:
+    """follow-up 追问回复卡片。"""
+    elements = []
+    elements.append({
+        "tag": "markdown",
+        "content": content,
+    })
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "追问中  ·  继续提问  ·  发「新主题」开始新脑暴  ·  发「退出」结束追问",
+        }],
+    })
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"content": "脑暴追问", "tag": "plain_text"},
+            "template": "turquoise",
+        },
+        "elements": elements,
+    }
 
 
 # ── 消息处理 ─────────────────────────────────────────────────
@@ -195,15 +372,71 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
     def _process(mid: str, text: str, uid: Optional[str]):
         try:
-            lower = text.strip().lower()
+            lower = text.strip().lower().rstrip("!！~")
+            user_key = uid or mid
+            session = _get_session(user_key)
+            current_mode = session.get("mode", "idle")
+
             if lower in ("帮助", "help", "?", "？"):
                 reply_card(mid, _help())
                 return
+
+            # ── follow-up 模式：退出追问
+            if current_mode == "followup" and lower in _EXIT_FOLLOWUP_TRIGGERS:
+                _update_session(user_key, mode="idle", followup_history=[])
+                reply_card(mid, progress_card(
+                    "已退出追问",
+                    "追问已结束。发新主题可以再来一轮脑暴。",
+                    color="blue",
+                ))
+                return
+
+            # ── follow-up 模式：开始新脑暴
+            if current_mode == "followup" and lower in _NEW_TOPIC_TRIGGERS:
+                _update_session(user_key, mode="idle", followup_history=[],
+                    topic="", round_summaries=[], final_output="", session_path="")
+                reply_card(mid, _welcome())
+                return
+
+            # ── follow-up 模式：追问对话
+            if current_mode == "followup":
+                # 如果用户发了一个新的有效脑暴主题（较长文本，非追问口吻），也当新脑暴处理
+                # 但大部分情况下 follow-up 模式下的消息都是追问
+                with _running_lock:
+                    if _running_sessions.get(user_key):
+                        reply_message(mid, "上一个请求还在处理中，请稍等...")
+                        return
+                    _running_sessions[user_key] = "followup"
+                try:
+                    _log(f"follow-up 追问: user={user_key[:20]} text={text[:60]!r}")
+                    result = _do_followup(user_key, text)
+                    card = _followup_card(result)
+                    reply_card(mid, card)
+                except Exception as e:
+                    _log(f"follow-up 异常: {e}\n{traceback.format_exc()}")
+                    reply_message(mid, "追问出错，请稍后重试")
+                finally:
+                    with _running_lock:
+                        _running_sessions.pop(user_key, None)
+                return
+
+            # ── 正在脑暴中
+            if current_mode == "brainstorming":
+                with _running_lock:
+                    if user_key in _running_sessions:
+                        reply_card(mid, progress_card(
+                            "脑暴进行中",
+                            f"当前主题：**{_running_sessions[user_key][:40]}**\n\n请等脑暴结束后再操作。",
+                            color="orange",
+                        ))
+                        return
+
+            # ── idle 模式：解析主题
             topic, context = _parse_brainstorm_input(text)
             if not topic:
                 reply_card(mid, _welcome())
                 return
-            user_key = uid or mid
+
             with _running_lock:
                 if user_key in _running_sessions:
                     reply_card(mid, progress_card(
@@ -213,29 +446,55 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                     return
                 _running_sessions[user_key] = topic
+
+            _update_session(user_key, mode="brainstorming", topic=topic,
+                round_summaries=[], final_output="", followup_history=[])
+
             reply_card(mid, progress_card(
                 "正在启动脑暴",
                 f"**主题：**{topic[:200]}\n\n讨论过程将实时推送到飞书群，完成后我会通知你。",
             ))
             _log(f"启动脑暴: topic={topic[:80]!r}")
             try:
-                # 脑暴机器人发起的脑暴 → 推送到脑暴专用 webhook（与 conductor 发起的脑暴分群）
                 brainstorm_webhook = (
                     os.environ.get("BRAINSTORM_FEISHU_WEBHOOK") or os.environ.get("FEISHU_WEBHOOK") or ""
                 ).strip() or None
-                path = run_brainstorm(topic=topic, context=context, webhook=brainstorm_webhook)
-                done_card = result_card(
-                    "脑暴完成",
-                    fields=[("主题", topic[:100]), ("会话文件", f"`{path}`")],
-                    next_actions=["发新主题再来一轮", "去飞书群看完整讨论"],
+                bs_result = run_brainstorm(topic=topic, context=context, webhook=brainstorm_webhook)
+
+                final_output = getattr(bs_result, "final_output", "")
+                _update_session(user_key,
+                    mode="followup",
+                    topic_refined=getattr(bs_result, "topic_refined", ""),
+                    round_summaries=getattr(bs_result, "round_summaries", []),
+                    final_output=final_output,
+                    session_path=str(bs_result),
                 )
+
+                # 把最终交付内容发到 1-on-1，用户直接在这里看结果、追问
+                if final_output:
+                    delivery_card = _final_delivery_card(final_output)
+                    if uid:
+                        send_card_to_user(uid, delivery_card)
+                    else:
+                        reply_card(mid, delivery_card)
+
+                done_card = _done_card_with_followup(topic, str(bs_result))
                 if uid:
                     send_card_to_user(uid, done_card)
                 else:
                     reply_card(mid, done_card)
-                _log(f"脑暴完成: {path}")
+                try:
+                    from core.events import emit as _emit_event
+                    _emit_event("brainstorm", "session_completed",
+                                f"脑暴完成: {topic[:50]}",
+                                user_id=uid or "",
+                                meta={"topic": topic[:100], "path": str(bs_result)})
+                except Exception:
+                    pass
+                _log(f"脑暴完成: {bs_result}")
             except Exception as e:
                 _log(f"脑暴异常: {e}\n{traceback.format_exc()}")
+                _update_session(user_key, mode="idle")
                 err = error_card("脑暴执行出错", "内部错误，请稍后重试", suggestions=["重新发送主题再试一次"])
                 if uid:
                     send_card_to_user(uid, err)
@@ -289,10 +548,8 @@ RECONNECT_MULTIPLIER = 2          # 每次翻倍
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_p2p_chat_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)

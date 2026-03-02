@@ -87,6 +87,8 @@ class BrandSkill(Skill):
 
     def load_brand(self, name: str) -> Optional[dict]:
         """按品牌文件名（不含 .yaml）或品牌中文名加载。"""
+        if ".." in name or "/" in name or "\\" in name:
+            return None
         exact = self.brands_dir / f"{name}.yaml"
         if exact.exists():
             return _load_yaml(exact)

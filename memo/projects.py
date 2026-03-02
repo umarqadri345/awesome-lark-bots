@@ -19,6 +19,11 @@ _lock = threading.Lock()
 PROJECT_HEADERS = ["任务/议题", "来源", "负责人", "状态", "优先级", "截止日期", "备注"]
 
 
+def _normalize_name(name: str) -> str:
+    """统一项目名称：去首尾空格、转小写、合并连续空格。"""
+    return " ".join(name.strip().lower().split())
+
+
 def _path() -> str:
     return (os.environ.get("PROJECT_STORE_PATH") or "").strip() or _DEFAULT_PATH
 
@@ -47,8 +52,19 @@ def register_project(
     sheet_id: str,
     url: str,
     created_by: str = "",
+    tags: Optional[List[str]] = None,
+    source: str = "",
+    doc_type: str = "",
+    team_code: str = "",
 ) -> str:
-    """注册新项目，返回 project_id。"""
+    """注册新项目，返回 project_id。
+
+    新增可选字段：
+      tags      — 项目标签列表，如 ["营销", "Q3"]
+      source    — 来源标识，如 "planner"
+      doc_type  — 文档类型，如 "执行 Brief"
+      team_code — 所属团队码（空 = 个人/全局）
+    """
     project = {
         "id": str(uuid.uuid4()),
         "name": name.strip(),
@@ -57,7 +73,14 @@ def register_project(
         "url": url,
         "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "created_by": created_by,
+        "team_code": team_code,
     }
+    if tags:
+        project["tags"] = tags
+    if source:
+        project["source"] = source
+    if doc_type:
+        project["doc_type"] = doc_type
     with _lock:
         items = _load()
         items.append(project)
@@ -65,31 +88,49 @@ def register_project(
     return project["id"]
 
 
-def list_projects() -> List[Dict[str, Any]]:
-    """列出所有项目。"""
-    return _load()
+def list_projects(team_code: str = "") -> List[Dict[str, Any]]:
+    """列出项目。传 team_code 则只返回该团队的项目。"""
+    with _lock:
+        items = list(_load())
+    if team_code:
+        items = [p for p in items if p.get("team_code") == team_code]
+    return items
 
 
-def find_project(name: str) -> Optional[Dict[str, Any]]:
-    """按名称模糊查找项目（大小写不敏感）。"""
-    name_lower = name.strip().lower()
-    items = _load()
-    for p in items:
-        if p["name"].lower() == name_lower:
+def find_project(name: str, team_code: str = "") -> Optional[Dict[str, Any]]:
+    """按名称模糊查找项目（归一化后比较）。优先在 team_code 范围内查找。"""
+    key = _normalize_name(name)
+    with _lock:
+        items = _load()
+    if team_code:
+        scoped = [p for p in items if p.get("team_code") == team_code]
+    else:
+        scoped = items
+    for p in scoped:
+        if _normalize_name(p["name"]) == key:
             return p
-    for p in items:
-        if name_lower in p["name"].lower():
+    for p in scoped:
+        if key in _normalize_name(p["name"]):
             return p
+    if team_code:
+        for p in items:
+            if _normalize_name(p["name"]) == key:
+                return p
     return None
 
 
-def delete_project(name: str) -> Tuple[bool, str]:
+def delete_project(name: str, team_code: str = "") -> Tuple[bool, str]:
     """按名称删除项目注册（不删飞书表格）。"""
-    name_lower = name.strip().lower()
+    key = _normalize_name(name)
     with _lock:
         items = _load()
         before = len(items)
-        items = [p for p in items if p["name"].lower() != name_lower]
+        if team_code:
+            items = [p for p in items if not (
+                _normalize_name(p["name"]) == key and p.get("team_code") == team_code
+            )]
+        else:
+            items = [p for p in items if _normalize_name(p["name"]) != key]
         if len(items) == before:
             return False, f"未找到项目「{name}」"
         _save(items)

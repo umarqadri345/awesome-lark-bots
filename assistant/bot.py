@@ -30,7 +30,7 @@ import threading
 import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
+from typing import Any, Dict, Optional
 
 try:
     from dotenv import load_dotenv
@@ -57,6 +57,7 @@ from core.feishu_client import (
 from core.cards import make_card, welcome_card, action_card, help_card, error_card, progress_card
 from core.llm import chat
 from memo.intent import parse_intent
+from memo.boards import register_board, find_board
 from memo.projects import (
     register_project, list_projects as store_list_projects,
     find_project, PROJECT_HEADERS,
@@ -72,6 +73,7 @@ from memo.store import (
     add_memo as store_add_memo,
     list_memos as store_list_memos,
     delete_memo_by_index as store_delete_memo_by_index,
+    delete_memo_by_content as store_delete_memo_by_content,
     set_memo_category_by_index as store_set_memo_category_by_index,
     complete_memo_by_index as store_complete_by_index,
     complete_memo_by_content as store_complete_by_content,
@@ -86,6 +88,9 @@ from memo.store import (
 from memo.threads import extract_thread_tag, detect_thread
 from cal.aggregator import aggregate_for_date
 from cal.push_target import save_push_target_open_id
+
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
 
 # ── 日志 ─────────────────────────────────────────────────────
 
@@ -105,6 +110,42 @@ def _log(msg: str) -> None:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
         except Exception:
             pass
+
+
+# ── 等待输入状态（用于创建预算等多步流程）──────────────────────
+_pending_state: Dict[str, Dict[str, Any]] = {}
+_pending_lock = threading.Lock()
+_PENDING_STATE_TTL = 1800  # 30 min
+
+
+def _cleanup_expired_pending():
+    """清理过期的 pending 条目（调用方需持有 _pending_lock）。"""
+    now = time.time()
+    expired = [k for k, v in _pending_state.items()
+               if now - v.get("ts", 0) > _PENDING_STATE_TTL]
+    for k in expired:
+        del _pending_state[k]
+
+
+def _set_pending(user_key: str, state_type: str, **kwargs):
+    with _pending_lock:
+        _cleanup_expired_pending()
+        _pending_state[user_key] = {"type": state_type, "ts": time.time(), **kwargs}
+
+
+def _get_pending(user_key: str) -> Optional[Dict[str, Any]]:
+    with _pending_lock:
+        _cleanup_expired_pending()
+        state = _pending_state.get(user_key)
+        if state and time.time() - state.get("ts", 0) > _PENDING_STATE_TTL:
+            _pending_state.pop(user_key, None)
+            return None
+        return state
+
+
+def _clear_pending(user_key: str):
+    with _pending_lock:
+        _pending_state.pop(user_key, None)
 
 
 # ── 工具函数 ─────────────────────────────────────────────────
@@ -131,6 +172,49 @@ def _parse_memo_content_and_category(text: str) -> tuple[str, Optional[str]]:
             content = (parts[0] + (parts[1] or "")).strip().replace("  ", " ").strip()
             return content or t.replace(tag, "").strip(), key
     return t, None
+
+
+def _auto_append_board(thread: str, content: str, status: str = "⬜ 进行中"):
+    """备忘添加后自动追加到已注册的线程看板（静默失败）。"""
+    if not thread:
+        return
+    board = find_board(thread)
+    if not board:
+        return
+    try:
+        from datetime import datetime as _dt
+        created = _dt.utcnow().strftime("%Y-%m-%d")
+        append_spreadsheet_rows(
+            board["spreadsheet_token"],
+            board["sheet_id"],
+            [[thread, content[:120], status, created, "今日新增"]],
+        )
+    except Exception:
+        pass
+
+
+def _split_multi_memos(text: str) -> list[str]:
+    """将一条消息拆分为多条备忘。
+
+    支持：换行分隔、数字编号（1. / 1、/ 1) ）、分号/顿号分隔。
+    单条内容原样返回（长度为 1 的列表）。
+    """
+    lines = text.strip().splitlines()
+    if len(lines) > 1:
+        items = []
+        for ln in lines:
+            ln = ln.strip()
+            ln = re.sub(r"^(\d+)[.、)）]\s*", "", ln)
+            if ln:
+                items.append(ln)
+        if len(items) > 1:
+            return items
+
+    parts = re.split(r"[；;]\s*", text.strip())
+    if len(parts) > 1:
+        return [p.strip() for p in parts if p.strip()]
+
+    return [text.strip()]
 
 
 def _parse_memo_with_thread(text: str) -> tuple[str, Optional[str], str]:
@@ -232,6 +316,130 @@ def _send_research_report(
     _log(f"研究报告已发送: {topic[:30]} ({total} 张卡片, {len(report)} 字)")
 
 
+# ── 团队管理指令 ────────────────────────────────────────────
+
+def _handle_team_command(text: str, open_id: str, mid: str) -> bool:
+    """处理团队相关指令。匹配则回复并返回 True，否则返回 False。"""
+    from core.team import (
+        create_team, join_team, leave_team, get_current_team,
+        get_user_teams, switch_team, get_team, list_members,
+    )
+    t = text.strip()
+    t_lower = t.lower()
+
+    # 创建团队 XXX
+    m = re.match(r"^创建团队\s+(.+)$", t)
+    if m:
+        name = m.group(1).strip()
+        ok, result = create_team(name, open_id)
+        if ok:
+            reply_card(mid, action_card(
+                "🏢 团队已创建",
+                f"**{result['name']}**\n\n"
+                f"团队码：**{result['code']}**\n\n"
+                f"把团队码分享给成员，对我说「加入团队 {result['code']}」即可加入。",
+                hints=["「我的团队」查看详情", "「创建项目 xxx」为团队创建项目"],
+                color="green",
+            ))
+        else:
+            reply_message(mid, f"创建失败：{result.get('error', '未知错误')}")
+        return True
+
+    # 加入团队 XXX
+    m = re.match(r"^加入团队\s+([A-Za-z0-9]+)$", t)
+    if m:
+        code = m.group(1).strip().upper()
+        ok, msg = join_team(code, open_id)
+        if ok:
+            team = get_team(code)
+            bindings_info = ""
+            if team and team.get("bindings"):
+                links = []
+                for rtype, info in team["bindings"].items():
+                    url = info.get("url", "")
+                    if url:
+                        links.append(f"- {rtype}: [打开]({url})")
+                if links:
+                    bindings_info = "\n\n**团队资源：**\n" + "\n".join(links)
+            reply_card(mid, action_card(
+                "🏢 加入成功",
+                f"{msg}{bindings_info}",
+                hints=["「我的团队」查看详情", "「项目列表」查看团队项目"],
+                color="green",
+            ))
+        else:
+            reply_message(mid, msg)
+        return True
+
+    # 离开团队 (当前团队)
+    if t_lower in ("离开团队", "退出团队"):
+        team = get_current_team(open_id)
+        if not team:
+            reply_message(mid, "你当前没有加入任何团队。")
+        else:
+            ok, msg = leave_team(team["code"], open_id)
+            reply_message(mid, msg)
+        return True
+
+    # 切换团队
+    m = re.match(r"^(?:切换(?:到|为)?|切到)\s*(.+?)(?:团队)?$", t)
+    if m:
+        from core.team import resolve_team_by_name
+        hint = m.group(1).strip()
+        matched = resolve_team_by_name(open_id, hint)
+        if matched:
+            switch_team(open_id, matched["code"])
+            reply_card(mid, action_card(
+                "🏢 已切换团队",
+                f"当前团队：**{matched['name']}**（{len(matched['members'])} 人）",
+                hints=["「项目列表」查看团队项目", "「本月花费」查看团队花费"],
+                color="blue",
+            ))
+        else:
+            teams = get_user_teams(open_id)
+            if teams:
+                names = "、".join(f"「{t['name']}」" for t in teams)
+                reply_message(mid, f"没找到匹配的团队。你加入的团队有：{names}")
+            else:
+                reply_message(mid, "你还没有加入任何团队。说「创建团队 名称」或「加入团队 码」")
+        return True
+
+    # 我的团队 / 团队信息 / 团队列表
+    if t_lower in ("我的团队", "团队信息", "团队列表", "team", "teams"):
+        teams = get_user_teams(open_id)
+        current = get_current_team(open_id)
+        if not teams:
+            reply_card(mid, action_card(
+                "🏢 团队",
+                "你还没有加入任何团队。\n\n"
+                "说「**创建团队 名称**」创建一个，\n"
+                "或说「**加入团队 码**」加入已有的团队。",
+                color="blue",
+            ))
+        else:
+            lines = []
+            for t_info in teams:
+                marker = " ← 当前" if current and t_info["code"] == current["code"] else ""
+                lines.append(
+                    f"**{t_info['name']}**{marker}\n"
+                    f"  码：`{t_info['code']}`　成员：{len(t_info['members'])} 人"
+                )
+            hints = ["「切换到 团队名」切换", "「项目列表」查看当前团队项目"]
+            reply_card(mid, action_card("🏢 我的团队", "\n\n".join(lines), hints=hints, color="blue"))
+        return True
+
+    # 团队码 (查看当前团队码)
+    if t_lower in ("团队码",):
+        team = get_current_team(open_id)
+        if team:
+            reply_message(mid, f"当前团队「{team['name']}」的团队码：**{team['code']}**")
+        else:
+            reply_message(mid, "你当前没有加入任何团队。")
+        return True
+
+    return False
+
+
 # ── 消息处理 ─────────────────────────────────────────────────
 
 def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -278,6 +486,89 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_card(mid, _welcome())
                 return
 
+            # ── 团队指令 ──────────────────────────────────────
+            _team_result = _handle_team_command(t, user_open_id or "", mid)
+            if _team_result:
+                return
+
+            # ── 等待输入状态处理（多步流程）──
+            _user_key = user_open_id or mid
+            _ps = _get_pending(_user_key)
+            if _ps:
+                if t.lower() in ("取消", "cancel", "算了"):
+                    _clear_pending(_user_key)
+                    reply_message(mid, "已取消。")
+                    return
+
+                if _ps["type"] == "awaiting_budget_items":
+                    proj_name = _ps.get("project", "")
+                    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+                    budget_items = []
+                    for ln in lines:
+                        ln = re.sub(r"^[\d.、)）]\s*", "", ln)
+                        parts = re.split(r"\s+", ln.strip(), maxsplit=1)
+                        if len(parts) == 2:
+                            cat, amt_str = parts
+                            try:
+                                amt = float(amt_str.replace(",", "").replace("¥", "").replace("￥", ""))
+                                budget_items.append({"name": cat, "category": cat, "budget": amt})
+                            except ValueError:
+                                budget_items.append({"name": ln, "category": "其他", "budget": 0})
+                        elif len(parts) == 1:
+                            budget_items.append({"name": parts[0], "category": parts[0], "budget": 0})
+
+                    if not budget_items:
+                        reply_message(mid, "格式不太对，请每行输入「类别 金额」，例如：营销 50000\n或发「取消」跳过。")
+                        return
+
+                    _clear_pending(_user_key)
+                    from memo.finance import create_budget as fin_create_budget
+                    budget = fin_create_budget(proj_name, budget_items)
+                    total = budget.get("total_budget", 0)
+                    item_lines = [f"- {it['name']}: ¥{it['budget']:,.0f}" for it in budget_items]
+                    reply_card(mid, action_card(
+                        f"💰 预算已创建 — {proj_name}",
+                        f"总预算 **¥{total:,.0f}**\n\n" + "\n".join(item_lines),
+                        hints=[f"「记账 描述 金额 #{proj_name}」记账", f"「{proj_name} 预算」查看预算执行"],
+                        color="green",
+                    ))
+                    return
+
+                if _ps["type"] == "awaiting_goal":
+                    proj_name = _ps.get("project", "")
+                    _clear_pending(_user_key)
+                    from memo.finance import add_goal as fin_add_goal
+                    goal = fin_add_goal(proj_name, t, "100", "%")
+                    reply_card(mid, action_card(
+                        f"🎯 目标已创建 — {proj_name}",
+                        f"**{t}**（目标 100%）",
+                        hints=[f"「更新目标 {t[:10]} 50」更新进度", f"「{proj_name} 总览」查看项目全貌"],
+                        color="green",
+                    ))
+                    return
+
+                if _ps["type"] == "awaiting_expense_project":
+                    _clear_pending(_user_key)
+                    desc = _ps.get("description", "")
+                    amt = _ps.get("amount", 0)
+                    exp_type = _ps.get("expense_type", "支出")
+                    proj_tag = ""
+                    if t.lower() not in ("确认", "ok", "跳过", "不归入"):
+                        proj_tag = t.strip().lstrip("#")
+                    record = add_expense(
+                        amount=amt, description=desc,
+                        expense_type=exp_type, project=proj_tag,
+                        user_open_id=user_open_id or "",
+                    )
+                    tag_info = f"　#{proj_tag}" if proj_tag else ""
+                    reply_card(mid, action_card(
+                        f"✅ 已记账",
+                        f"**{exp_type}** ¥{amt:,.2f} — {desc}{tag_info}\n日期：{record['date']}",
+                        hints=["「本月花费」查看月度汇总", "「预算概览 项目名」查预算"],
+                        color="green",
+                    ))
+                    return
+
             # ── 关键词快速匹配：备忘 ──
             prefixes = (
                 "备忘 ", "备忘：", "备忘:", "记一下 ", "记一下：", "记一下:",
@@ -290,11 +581,31 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     if not raw_content:
                         reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
                         return
+                    items = _split_multi_memos(raw_content)
+                    if len(items) > 1:
+                        saved = []
+                        for item in items:
+                            c, cat, th = _parse_memo_with_thread(item)
+                            if c:
+                                store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th)
+                                _auto_append_board(th, c)
+                                tag = f" #{th}" if th else ""
+                                saved.append(f"- {c[:60]}{tag}")
+                        if saved:
+                            reply_card(mid, action_card(
+                                f"📝 已记下 {len(saved)} 条备忘",
+                                "\n".join(saved),
+                                hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
+                                color="green",
+                            ))
+                            _log(f"备忘(多条拆分): {len(saved)} 条")
+                        return
                     content, category, thread = _parse_memo_with_thread(raw_content)
                     if not content:
                         reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
                         return
                     store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread)
+                    _auto_append_board(thread, content)
                     tag_hint = ""
                     if thread:
                         tag_hint = f" #{thread}"
@@ -314,6 +625,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 if raw_content:
                     content, category, thread = _parse_memo_with_thread(raw_content)
                     store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread)
+                    _auto_append_board(thread, content)
                     tag_hint = f" #{thread}" if thread else ""
                     reply_card(mid, action_card(
                         f"📝 已记下备忘{tag_hint}",
@@ -329,31 +641,93 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # ── 完成备忘 ──
-            m_done = re.match(r"^(完成|done|搞定|✅)\s*[：:]?\s*(\d+)$", t, re.IGNORECASE)
+            _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            def _cn2int(s: str) -> Optional[int]:
+                s = s.strip()
+                if s.isdigit():
+                    return int(s)
+                if s in _CN_NUM:
+                    return _CN_NUM[s]
+                if s.startswith("十") and len(s) == 2 and s[1] in _CN_NUM:
+                    return 10 + _CN_NUM[s[1]]
+                return None
+
+            _done_prefix = r"(完成|done|搞定|✅|做完了|标记完成|已完成|办好了|弄好了)"
+
+            m_done = re.match(
+                rf"^{_done_prefix}\s*第?\s*(\d+)\s*条?\s*$", t, re.IGNORECASE
+            )
             if m_done:
                 idx = int(m_done.group(2))
                 ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
                 reply_message(mid, msg_text)
                 return
-            m_done_kw = re.match(r"^(完成|done|搞定|✅)\s*[：:]?\s*(.+)$", t, re.IGNORECASE)
+
+            m_done_cn = re.match(
+                rf"^{_done_prefix}\s*第?\s*([一二三四五六七八九十]+)\s*条?\s*$", t, re.IGNORECASE
+            )
+            if m_done_cn:
+                idx = _cn2int(m_done_cn.group(2))
+                if idx:
+                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
+                    return
+
+            m_done_rev = re.match(
+                r"^第\s*(\d+|[一二三四五六七八九十]+)\s*条?\s*(完成|搞定|做完了|办好了|弄好了)\s*$", t
+            )
+            if m_done_rev:
+                idx = _cn2int(m_done_rev.group(1))
+                if idx:
+                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
+                    return
+
+            m_done_kw = re.match(
+                rf"^{_done_prefix}\s*[：:]?\s*(.+)$", t, re.IGNORECASE
+            )
             if m_done_kw:
                 keyword = m_done_kw.group(2).strip()
-                ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
-                reply_message(mid, msg_text)
-                return
+                if not keyword.isdigit() and keyword not in _CN_NUM:
+                    ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
+                    return
 
-            # ── 清除备忘 ──
-            m_clear = re.match(r"^(清除备忘|删除备忘)\s*[：:]\s*(\d+)$", t)
-            if not m_clear:
-                m_clear = re.match(r"^(清除备忘|删除备忘)\s+(\d+)$", t)
+            # ── 清除/删除备忘 ──
+            _del_idx = None
+            m_clear = re.match(
+                r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*第?\s*(\d+)\s*条?\s*$", t
+            )
             if m_clear:
+                _del_idx = m_clear.group(2)
+            if not _del_idx:
+                m_clear2 = re.match(
+                    r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*[：:]\s*(\d+)\s*$", t
+                )
+                if m_clear2:
+                    _del_idx = m_clear2.group(2)
+            if not _del_idx:
+                m_clear3 = re.match(r"^第\s*(\d+)\s*条?\s*(删掉|删除|移除|去掉)\s*$", t)
+                if m_clear3:
+                    _del_idx = m_clear3.group(1)
+            if _del_idx:
                 try:
-                    idx = int(m_clear.group(2))
+                    idx = int(_del_idx)
                     ok, msg_text = store_delete_memo_by_index(idx, user_open_id=user_open_id)
                     reply_message(mid, msg_text)
                     return
                 except ValueError:
                     pass
+
+            m_clear_kw = re.match(
+                r"^(清除备忘|删除备忘|删掉备忘|删掉|删除|移除|去掉)\s*[：:]?\s*(.+)$", t
+            )
+            if m_clear_kw:
+                keyword = m_clear_kw.group(2).strip()
+                if not keyword.isdigit():
+                    ok, msg_text = store_delete_memo_by_content(keyword, user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
+                    return
 
             # ── 设置分类 ──
             m_set_cat = (
@@ -414,8 +788,34 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_message(mid, "已记下备忘～")
                 return
 
-            if action == "add_memo":
+            if action in ("add_memo", "add_memos"):
                 raw = params.get("content") or text.strip()
+                items_from_llm = params.get("items")
+                if isinstance(items_from_llm, list) and len(items_from_llm) > 1:
+                    memo_items = items_from_llm
+                else:
+                    memo_items = _split_multi_memos(raw)
+
+                if len(memo_items) > 1:
+                    saved = []
+                    for item in memo_items:
+                        c, cat, th = _parse_memo_with_thread(item.strip() if isinstance(item, str) else str(item))
+                        if c:
+                            store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th)
+                            _auto_append_board(th, c)
+                            tag = f" #{th}" if th else ""
+                            saved.append(f"- {c[:60]}{tag}")
+                    if saved:
+                        reply_card(mid, action_card(
+                            f"📝 已记下 {len(saved)} 条备忘",
+                            "\n".join(saved),
+                            hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
+                            color="green",
+                        ))
+                    else:
+                        reply_message(mid, "请说一下要记的备忘内容～")
+                    return
+
                 content, category, thread = _parse_memo_with_thread(raw)
                 if not content:
                     reply_message(mid, "请说一下要记的备忘内容～")
@@ -424,6 +824,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     thread = (params.get("thread") or "").strip()
                 reminder = (params.get("reminder_date") or "").strip() or None
                 store_add_memo(content, user_open_id=user_open_id, reminder_date=reminder, category=category, thread=thread)
+                _auto_append_board(thread, content)
                 tag_hint = f" #{thread}" if thread else ""
                 date_hint = f"（提醒：{reminder}）" if reminder else ""
                 reply_message(mid, f"已记下备忘～{tag_hint}{date_hint}")
@@ -509,16 +910,20 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
             if action == "delete_memo":
                 idx = params.get("index") or params.get("序号")
-                if idx is None:
-                    reply_message(mid, "请说「清除备忘 序号」或「删除备忘 3」。")
+                keyword = params.get("keyword", "")
+                if idx is not None:
+                    try:
+                        num = int(idx)
+                        ok, msg_text = store_delete_memo_by_index(num, user_open_id=user_open_id)
+                        reply_message(mid, msg_text)
+                        return
+                    except (TypeError, ValueError):
+                        pass
+                if keyword:
+                    ok, msg_text = store_delete_memo_by_content(str(keyword), user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
                     return
-                try:
-                    num = int(idx)
-                except (TypeError, ValueError):
-                    reply_message(mid, "序号需为数字，例如：清除备忘 3")
-                    return
-                ok, msg_text = store_delete_memo_by_index(num, user_open_id=user_open_id)
-                reply_message(mid, msg_text)
+                reply_message(mid, "请说「删除 序号」或「删除 关键词」，例如：删除 3 / 删掉 买牛奶")
                 return
 
             if action == "complete_memo":
@@ -645,7 +1050,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         reply_card(mid, action_card("📊 月度报告", report, color="indigo"))
                 except Exception as e:
                     _log(f"月报生成失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("月报生成失败", str(e)[:200]))
+                    reply_card(mid, error_card("月报生成失败", "生成失败，请稍后重试。"))
                 return
 
             # ── 联网研究 ──
@@ -669,7 +1074,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     _log(f"研究失败: {e}\n{traceback.format_exc()}")
                     if user_open_id:
                         send_card_to_user(user_open_id, error_card(
-                            "研究失败", f"原因：{str(e)[:200]}",
+                            "研究失败", "生成失败，请稍后重试。",
                             suggestions=["换个说法重试", "发「帮助」查看指令"],
                         ))
                     return
@@ -683,7 +1088,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 title = f"📋 线程看板 — #{thread_filter}" if thread_filter else "📋 线程看板"
                 reply_card(mid, progress_card("正在生成看板", title, color="blue"))
                 try:
-                    headers, rows = export_board_data(
+                    headers, rows, board_stats = export_board_data(
                         user_open_id=user_open_id,
                         thread=thread_filter or None,
                     )
@@ -693,25 +1098,66 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             hints=["发「备忘 xxx #线程」添加内容", "发「线程」查看现有线程"],
                             color="blue"))
                         return
-                    ok, result = create_spreadsheet_with_data(
-                        title=title, headers=headers, rows=rows,
-                        owner_open_id=user_open_id, theme="blue",
+
+                    _stats_line = (
+                        f"今日新增 {board_stats['today']} 条 | "
+                        f"本周进行中 {board_stats['week']} 条 | "
+                        f"等待跟进 {board_stats['stale']} 条 | "
+                        f"已完成 {board_stats['done']} 条"
                     )
-                    if ok:
-                        reply_card(mid, action_card(
-                            "📋 线程看板已生成",
-                            f"**{title}**\n\n"
-                            f"[点击打开表格]({result})\n\n"
-                            f"共 {len(rows)} 条备忘"
-                            + (f"，线程 #{thread_filter}" if thread_filter else ""),
-                            hints=["数据来自你的备忘，可在飞书中编辑", "再发「看板」可重新生成最新版"],
-                            color="green",
-                        ))
-                    else:
-                        reply_card(mid, error_card("生成看板失败", result[:200]))
+
+                    existing = find_board(thread_filter) if thread_filter else None
+                    if existing:
+                        ok_a, msg_a = append_spreadsheet_rows(
+                            existing["spreadsheet_token"],
+                            existing["sheet_id"],
+                            rows,
+                        )
+                        if ok_a:
+                            reply_card(mid, action_card(
+                                "📋 线程看板已更新",
+                                f"**{title}**\n\n"
+                                f"[点击打开表格]({existing['url']})\n\n"
+                                f"{_stats_line}",
+                                hints=["新增备忘会自动追加到此看板", "发「看板」可重新刷新"],
+                                color="green",
+                            ))
+                        else:
+                            _log(f"更新看板失败: {msg_a}")
+                            reply_card(mid, error_card("更新看板失败，正在重新创建", "操作失败，请稍后重试。"))
+                            existing = None
+
+                    if not existing:
+                        ok, detail = create_spreadsheet_detail(
+                            title=title, headers=headers, rows=rows,
+                            owner_open_id=user_open_id, theme="blue",
+                            partition_col=4,
+                        )
+                        if ok:
+                            if thread_filter:
+                                register_board(
+                                    thread=thread_filter,
+                                    spreadsheet_token=detail["spreadsheet_token"],
+                                    sheet_id=detail["sheet_id"],
+                                    url=detail["url"],
+                                    user_open_id=user_open_id or "",
+                                )
+                            reply_card(mid, action_card(
+                                "📋 线程看板已生成",
+                                f"**{title}**\n\n"
+                                f"[点击打开表格]({detail['url']})\n\n"
+                                f"{_stats_line}"
+                                + ("\n\n新增备忘会自动追加到此看板" if thread_filter else ""),
+                                hints=["数据来自你的备忘，可在飞书中编辑", "再发「看板」可刷新"],
+                                color="green",
+                            ))
+                        else:
+                            err_msg = detail.get("error", str(detail)) if isinstance(detail, dict) else str(detail)
+                            _log(f"生成看板失败: {err_msg}")
+                            reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
                 except Exception as e:
                     _log(f"生成线程看板失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("生成看板失败", str(e)[:200]))
+                    reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 创建项目 ──
@@ -745,23 +1191,29 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             url=info["url"],
                             created_by=user_open_id or "",
                         )
+                        _user_key = user_open_id or mid
+                        _set_pending(_user_key, "awaiting_budget_items", project=proj_name)
                         reply_card(mid, action_card(
                             "📋 项目已创建",
                             f"**{proj_name}**\n\n"
                             f"[点击打开表格]({info['url']})\n\n"
-                            f"列：任务/议题 · 来源 · 负责人 · 状态 · 优先级 · 截止日期 · 备注",
+                            "**接下来设置预算**（每行：类别 金额）：\n"
+                            "> 营销 50000\n"
+                            "> 设计 10000\n"
+                            "> 差旅 5000\n\n"
+                            "直接发送预算项，或发「取消」跳过。",
                             hints=[
                                 f"「{proj_name} 加任务 xxx」添加任务",
                                 "发飞书妙记链接可直接归档",
-                                "粘贴会议纪要自动提取任务",
                             ],
                             color="green",
                         ))
                     else:
-                        reply_card(mid, error_card("创建项目失败", info.get("error", "")[:200]))
+                        _log(f"创建项目失败: {info}")
+                        reply_card(mid, error_card("创建项目失败", "操作失败，请稍后重试。"))
                 except Exception as e:
                     _log(f"创建项目失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("创建项目失败", str(e)[:200]))
+                    reply_card(mid, error_card("创建项目失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 项目列表 ──
@@ -821,10 +1273,11 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             color="green",
                         ))
                     else:
-                        reply_card(mid, error_card("添加任务失败", msg[:200]))
+                        _log(f"添加任务失败: {msg}")
+                        reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
                 except Exception as e:
                     _log(f"加任务失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("添加任务失败", str(e)[:200]))
+                    reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 导入飞书妙记 ──
@@ -837,7 +1290,8 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     return
                 ok, info = get_minutes_info(token)
                 if not ok:
-                    reply_card(mid, error_card("获取妙记失败", info.get("error", "")[:200],
+                    _log(f"获取妙记失败: {info}")
+                    reply_card(mid, error_card("获取妙记失败", "操作失败，请稍后重试。",
                         suggestions=["检查链接是否正确", "确认 bot 有妙记阅读权限"]))
                     return
                 minutes_title = info.get("title", "未知会议")
@@ -879,10 +1333,11 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             color="green",
                         ))
                     else:
-                        reply_card(mid, error_card("归档失败", msg[:200]))
+                        _log(f"归档失败: {msg}")
+                        reply_card(mid, error_card("归档失败", "操作失败，请稍后重试。"))
                 except Exception as e:
                     _log(f"导入妙记失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入妙记失败", str(e)[:200]))
+                    reply_card(mid, error_card("导入妙记失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 导入内容到项目（LLM 通用格式识别）──
@@ -975,10 +1430,11 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             color="green",
                         ))
                     else:
-                        reply_card(mid, error_card("写入失败", msg[:200]))
+                        _log(f"导入内容写入失败: {msg}")
+                        reply_card(mid, error_card("写入失败", "操作失败，请稍后重试。"))
                 except Exception as e:
                     _log(f"导入内容失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入内容失败", str(e)[:200]))
+                    reply_card(mid, error_card("导入内容失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 记账（含项目标签提示）──
@@ -999,6 +1455,9 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     tags = available_project_tags()
                     if tags:
                         tag_list = "　".join(f"`#{t}`" for t in tags[:8])
+                        _user_key = user_open_id or mid
+                        _set_pending(_user_key, "awaiting_expense_project",
+                                     description=desc, amount=amt, expense_type=exp_type)
                         reply_card(mid, action_card(
                             f"💰 {exp_type} ¥{amt:.0f} — {desc}",
                             f"要归入哪个项目？\n{tag_list}\n\n"
@@ -1095,7 +1554,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                 except Exception as e:
                     _log(f"批量记账失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入费用失败", str(e)[:200]))
+                    reply_card(mid, error_card("导入费用失败", "操作失败，请稍后重试。"))
                 return
 
             # ── 月度花费 ──
@@ -1130,7 +1589,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                 except Exception as e:
                     _log(f"月度花费失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", str(e)[:200]))
+                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
                 return
 
             # ── 创建预算 ──
@@ -1148,15 +1607,17 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         color="blue",
                     ))
                     return
+                _user_key = user_open_id or mid
+                _set_pending(_user_key, "awaiting_budget_items", project=proj_name)
                 reply_card(mid, action_card(
                     f"💰 创建预算 — {proj_name}",
                     "请发送预算项（每行一项），格式：\n"
-                    "```\n类别 金额\n```\n"
+                    "> 类别 金额\n\n"
                     "例如：\n"
                     "> 营销 50000\n"
                     "> 设计 10000\n"
                     "> 差旅 5000\n\n"
-                    "我会自动创建预算表。",
+                    "发「取消」跳过。",
                     color="blue",
                 ))
                 return
@@ -1190,7 +1651,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                 except Exception as e:
                     _log(f"预算概览失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", str(e)[:200]))
+                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
                 return
 
             # ── 设目标 ──
@@ -1262,7 +1723,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                 except Exception as e:
                     _log(f"项目总览失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", str(e)[:200]))
+                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
                 return
 
             # ── 查日程 ──
@@ -1302,7 +1763,10 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     "你是日程助手。根据下面汇总的日程与备忘，给用户一段简洁友好的总结与建议，控制在 200 字内。",
                     user_text=raw_text, bot_type="assistant",
                 )
-                reply_text = chat(raw_text, system_prompt=system_prompt) or raw_text
+                try:
+                    reply_text = chat(raw_text, system_prompt=system_prompt) or raw_text
+                except Exception:
+                    reply_text = raw_text
                 reply_card(mid, action_card(
                     f"📅 {agg['date']} 日程概览",
                     reply_text[:2000],
@@ -1320,7 +1784,10 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     "你是飞书里的备忘与日程助手。可以帮用户记备忘、加日历、查日程。请用简洁友好的中文回复。",
                     user_text=text, bot_type="assistant",
                 )
-                reply_text = chat(text, system_prompt=system_prompt) or "（暂无回复）"
+                try:
+                    reply_text = chat(text, system_prompt=system_prompt) or "（暂无回复）"
+                except Exception:
+                    reply_text = "（AI 暂时不可用，请稍后再试）"
             reply_message(mid, reply_text[:2000])
 
         except Exception as e:
@@ -1431,10 +1898,8 @@ def _run_health_server(port: int) -> None:
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_p2p_chat_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)
@@ -1494,6 +1959,65 @@ def main():
         except Exception as e:
             _log(f"定时任务异常: {e}\n{traceback.format_exc()}")
 
+    def _run_heartbeat():
+        """大管家 heartbeat — 定期扫描事件轨迹，决定是否需要主动通知用户。"""
+        _log("大管家 heartbeat 启动")
+        _last_scan_ts = ""
+        _HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", "900"))
+
+        while True:
+            try:
+                time.sleep(_HEARTBEAT_INTERVAL)
+                from core.events import scan, scan_summary
+                from cal.push_target import get_push_target_open_id
+
+                open_id = get_push_target_open_id()
+                if not open_id:
+                    continue
+
+                events = scan(hours=4, since_ts=_last_scan_ts)
+                if not events:
+                    continue
+
+                _last_scan_ts = events[-1].get("ts", _last_scan_ts)
+
+                alert_events = [e for e in events if e.get("event") == "alert"]
+                if alert_events:
+                    lines = ["⚡ **实时提醒**\n"]
+                    for e in alert_events:
+                        lines.append(f"- [{e.get('bot', '?')}] {e.get('summary', '')}")
+                    try:
+                        send_message_to_user(open_id, "\n".join(lines))
+                        _log(f"heartbeat: 推送 {len(alert_events)} 条告警")
+                    except Exception as e:
+                        _log(f"heartbeat 推送告警失败: {e}")
+                    continue
+
+                significant = [e for e in events if e.get("event") in (
+                    "session_completed", "planning_completed",
+                    "pipeline_completed", "report_completed",
+                    "digest_pushed",
+                )]
+                if len(significant) >= 3:
+                    summary_text = scan_summary(hours=4)
+                    try:
+                        from core.llm import chat as llm_chat
+                        decision = llm_chat(
+                            f"你是团队的大管家助手。以下是过去几小时各 bot 的活动记录：\n{summary_text}\n\n"
+                            "请判断是否需要通知用户。如果有值得汇报的进展（如脑暴完成、内容发布、舆情报告等），"
+                            "用简洁的中文写一段 50 字以内的通知。如果没什么重要的，只回复「无」。",
+                            system_prompt="你是一个判断是否需要打扰用户的 AI 助手。宁可漏报不可扰民。",
+                        )
+                        if decision and decision.strip() != "无":
+                            send_message_to_user(open_id, f"📋 **大管家速报**\n\n{decision.strip()}")
+                            _log(f"heartbeat: 推送速报 ({len(significant)} 个事件)")
+                    except Exception as e:
+                        _log(f"heartbeat LLM 决策失败: {e}")
+
+            except Exception as e:
+                _log(f"heartbeat 异常: {e}")
+                time.sleep(60)
+
     def _run_reminder_check():
         """检查到期提醒并推送。"""
         try:
@@ -1521,6 +2045,9 @@ def main():
         _log("定时推送已启用：08:00 晨报 / 18:00 收尾 / 周一 09:00 周报 / 每日 09:00 提醒检查")
     except ImportError:
         _log("定时推送已跳过：未安装 schedule")
+
+    threading.Thread(target=_run_heartbeat, daemon=True).start()
+    _log(f"大管家 heartbeat 已启用（间隔 {os.environ.get('HEARTBEAT_INTERVAL_SEC', '900')} 秒）")
 
     delay = RECONNECT_INITIAL_DELAY
     attempt = 0

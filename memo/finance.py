@@ -20,6 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 _DATA_DIR = str(Path(__file__).resolve().parent.parent / "data")
 _lock = threading.Lock()
 
+
+def _normalize_name(name: str) -> str:
+    """统一项目名称：去首尾空格、转小写、合并连续空格。"""
+    return " ".join(name.strip().lower().split())
+
 # ── 花费表模板列 ──────────────────────────────────────────────
 EXPENSE_HEADERS = ["日期", "类别", "项目", "描述", "金额", "收/支", "付款方式", "备注"]
 
@@ -64,8 +69,12 @@ def add_expense(
     expense_type: str = "支出",
     payment: str = "",
     user_open_id: str = "",
+    team_code: str = "",
 ) -> Dict[str, Any]:
-    """记一笔花费，返回记录。"""
+    """记一笔花费，返回记录。team_code 非空时归属团队账本。"""
+    amount = float(amount)
+    if amount < -1_000_000 or amount > 1_000_000_000:
+        raise ValueError(f"金额超出合理范围: {amount}")
     record = {
         "id": str(uuid.uuid4()),
         "date": date or datetime.utcnow().strftime("%Y-%m-%d"),
@@ -76,6 +85,7 @@ def add_expense(
         "type": expense_type,
         "payment": payment.strip(),
         "user_open_id": user_open_id,
+        "team_code": team_code,
         "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     with _lock:
@@ -89,24 +99,28 @@ def list_expenses(
     month: str = "",
     project: str = "",
     user_open_id: str = "",
+    team_code: str = "",
 ) -> List[Dict[str, Any]]:
-    """查询花费记录。month 格式 YYYY-MM，空则当月。"""
+    """查询花费记录。month 格式 YYYY-MM，空则当月。team_code 按团队过滤。"""
     if not month:
         month = datetime.utcnow().strftime("%Y-%m")
-    items = _load_expenses()
+    with _lock:
+        items = _load_expenses()
     items = [e for e in items if e["date"].startswith(month)]
     if project:
-        p = project.strip().lower()
-        items = [e for e in items if e.get("project", "").lower() == p]
-    if user_open_id:
+        p = _normalize_name(project)
+        items = [e for e in items if _normalize_name(e.get("project", "")) == p]
+    if team_code:
+        items = [e for e in items if e.get("team_code") == team_code]
+    elif user_open_id:
         items = [e for e in items if e.get("user_open_id") == user_open_id]
     items.sort(key=lambda e: e["date"])
     return items
 
 
-def month_summary(month: str = "") -> Dict[str, Any]:
-    """月度汇总：总额、按类别、按项目。"""
-    expenses = list_expenses(month=month)
+def month_summary(month: str = "", team_code: str = "", user_open_id: str = "") -> Dict[str, Any]:
+    """月度汇总：总额、按类别、按项目。按 team_code 或 user_open_id 隔离。"""
+    expenses = list_expenses(month=month, team_code=team_code, user_open_id=user_open_id)
     total = sum(e["amount"] for e in expenses if e["type"] == "支出")
     income = sum(e["amount"] for e in expenses if e["type"] == "收入")
 
@@ -130,9 +144,9 @@ def month_summary(month: str = "") -> Dict[str, Any]:
     }
 
 
-def export_month_rows(month: str = "") -> Tuple[List[str], List[List[str]]]:
+def export_month_rows(month: str = "", team_code: str = "", user_open_id: str = "") -> Tuple[List[str], List[List[str]]]:
     """导出月度花费为表格行，用于生成飞书表格。"""
-    expenses = list_expenses(month=month)
+    expenses = list_expenses(month=month, team_code=team_code, user_open_id=user_open_id)
     rows = []
     for e in expenses:
         rows.append([
@@ -198,7 +212,7 @@ def create_budget(
     }
     with _lock:
         budgets = _load_budgets()
-        budgets = [b for b in budgets if b["project"].lower() != project.strip().lower()]
+        budgets = [b for b in budgets if _normalize_name(b["project"]) != _normalize_name(project)]
         budgets.append(budget)
         _save_budgets(budgets)
     return budget
@@ -206,18 +220,21 @@ def create_budget(
 
 def find_budget(project: str) -> Optional[Dict[str, Any]]:
     """按项目名查找预算。"""
-    p = project.strip().lower()
-    for b in _load_budgets():
-        if b["project"].lower() == p:
+    p = _normalize_name(project)
+    with _lock:
+        budgets = _load_budgets()
+    for b in budgets:
+        if _normalize_name(b["project"]) == p:
             return b
-    for b in _load_budgets():
-        if p in b["project"].lower():
+    for b in budgets:
+        if p in _normalize_name(b["project"]):
             return b
     return None
 
 
 def list_budgets() -> List[Dict[str, Any]]:
-    return _load_budgets()
+    with _lock:
+        return _load_budgets()
 
 
 def budget_vs_actual(project: str) -> Tuple[List[str], List[List[str]], Dict[str, Any]]:
@@ -230,9 +247,10 @@ def budget_vs_actual(project: str) -> Tuple[List[str], List[List[str]], Dict[str
     if not budget:
         return BUDGET_HEADERS, [], {"error": f"未找到项目「{project}」的预算"}
 
-    all_expenses = _load_expenses()
-    proj_lower = project.strip().lower()
-    proj_expenses = [e for e in all_expenses if e.get("project", "").lower() == proj_lower and e["type"] == "支出"]
+    with _lock:
+        all_expenses = _load_expenses()
+    proj_key = _normalize_name(project)
+    proj_expenses = [e for e in all_expenses if _normalize_name(e.get("project", "")) == proj_key and e["type"] == "支出"]
 
     actual_by_category: Dict[str, float] = {}
     for e in proj_expenses:
@@ -338,10 +356,11 @@ def update_goal(goal_id: str, current: Optional[str] = None, status: Optional[st
 
 def list_goals(project: str = "") -> List[Dict[str, Any]]:
     """列出目标，可按项目筛选。"""
-    goals = _load_goals()
+    with _lock:
+        goals = _load_goals()
     if project:
-        p = project.strip().lower()
-        goals = [g for g in goals if g.get("project", "").lower() == p]
+        p = _normalize_name(project)
+        goals = [g for g in goals if _normalize_name(g.get("project", "")) == p]
     return goals
 
 
@@ -371,14 +390,15 @@ def project_dashboard(project: str) -> Tuple[List[str], List[List[str]]]:
       - finance/budgets → 预算定义
       - finance/goals → 目标 KPIs
     """
-    proj_lower = project.strip().lower()
+    proj_key = _normalize_name(project)
     rows: List[List[str]] = []
 
     # 预算维度
     budget = find_budget(project)
     if budget:
-        all_expenses = _load_expenses()
-        proj_expenses = [e for e in all_expenses if e.get("project", "").lower() == proj_lower and e["type"] == "支出"]
+        with _lock:
+            all_expenses = _load_expenses()
+        proj_expenses = [e for e in all_expenses if _normalize_name(e.get("project", "")) == proj_key and e["type"] == "支出"]
         total_budget = budget.get("total_budget", 0)
         total_actual = sum(e["amount"] for e in proj_expenses)
         usage = f"{total_actual / total_budget * 100:.0f}%" if total_budget > 0 else "-"
@@ -416,7 +436,9 @@ def available_project_tags() -> List[str]:
     """返回所有可用的项目标签（用于记账时提示用户选择）。"""
     from memo.projects import list_projects
     tags = [p["name"] for p in list_projects()]
-    for b in _load_budgets():
+    with _lock:
+        budgets = _load_budgets()
+    for b in budgets:
         if b["project"] not in tags:
             tags.append(b["project"])
     return tags

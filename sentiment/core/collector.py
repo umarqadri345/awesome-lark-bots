@@ -704,7 +704,7 @@ def collect_posts(profile: dict, browser_posts_path: str | None = None,
             log.info("Browser MCP HTTP 合并: +%d 条，去重后共 %d 条", len(extra), len(posts))
 
     # Phase 3: Web Search — Tavily + DuckDuckGo 补量
-    if WEB_SEARCH_ENABLED and (TAVILY_API_KEY or True):
+    if WEB_SEARCH_ENABLED:
         web_target = profile.get("web_search_target", WEB_SEARCH_TARGET)
         remaining = max(max_posts - len(posts), 0)
         actual_target = min(web_target, remaining) if remaining > 0 else web_target

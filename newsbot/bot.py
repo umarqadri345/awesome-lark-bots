@@ -41,9 +41,13 @@ SCHEDULE_HOUR = int(os.getenv("NEWSBOT_SCHEDULE_HOUR", "8"))
 SCHEDULE_MINUTE = int(os.getenv("NEWSBOT_SCHEDULE_MINUTE", "0"))
 NEWSBOT_PUSH_OPEN_ID = os.getenv("NEWSBOT_PUSH_OPEN_ID", "").strip()
 
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
+
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _token_cache: Optional[str] = None
 _token_expire_at: float = 0.0
+_token_lock = threading.Lock()
 
 # 飞书卡片限制
 MAX_CARD_ELEMENT_LEN = 3800          # 单个 markdown element 内容上限
@@ -56,20 +60,21 @@ CARD_SEND_INTERVAL = 1.5             # 多卡片之间发送间隔（秒）
 
 def _get_token() -> str:
     global _token_cache, _token_expire_at
-    now = time.time()
-    if _token_cache and _token_expire_at > now + 60:
+    with _token_lock:
+        now = time.time()
+        if _token_cache and _token_expire_at > now + 60:
+            return _token_cache
+        resp = _requests.post(
+            f"{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal",
+            json={"app_id": NEWSBOT_FEISHU_APP_ID, "app_secret": NEWSBOT_FEISHU_APP_SECRET},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"获取 token 失败: {data}")
+        _token_cache = data["tenant_access_token"]
+        _token_expire_at = now + data.get("expire", 7200)
         return _token_cache
-    resp = _requests.post(
-        f"{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal",
-        json={"app_id": NEWSBOT_FEISHU_APP_ID, "app_secret": NEWSBOT_FEISHU_APP_SECRET},
-        timeout=10,
-    )
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"获取 token 失败: {data}")
-    _token_cache = data["tenant_access_token"]
-    _token_expire_at = now + data.get("expire", 7200)
-    return _token_cache
 
 
 def _headers() -> dict:
@@ -409,11 +414,18 @@ def _daily_job():
         now = datetime.now(BEIJING)
         date_str = now.strftime("%Y年%m月%d日")
         push_report(report, date_str)
+        try:
+            from core.events import emit as _emit_event
+            _emit_event("newsbot", "digest_pushed",
+                        f"日报已推送: {date_str} ({len(report)} 字)",
+                        meta={"date": date_str, "len": len(report), "trigger": "scheduled"})
+        except Exception:
+            pass
         log.info("定时推送完成: %s (%d 字)", path.name, len(report))
     except Exception as e:
         log.error("定时任务失败: %s\n%s", e, traceback.format_exc())
         if NEWSBOT_FEISHU_WEBHOOK:
-            _webhook_send_text(f"❌ 早知天下事日报生成失败\n\n{str(e)[:500]}")
+            _webhook_send_text("❌ 早知天下事日报生成失败，请查看服务端日志。")
 
 
 def _scheduler_loop():
@@ -583,6 +595,14 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 date_str = now.strftime("%Y年%m月%d日")
 
                 push_cards_to_chat(message_id, open_id, report, date_str)
+                try:
+                    from core.events import emit as _emit_event
+                    _emit_event("newsbot", "digest_pushed",
+                                f"日报已推送: {date_str} ({len(report)} 字)",
+                                user_id=open_id or "",
+                                meta={"date": date_str, "len": len(report), "trigger": "manual"})
+                except Exception:
+                    pass
 
                 _respond(
                     f"✅ 日报已完成！\n"
@@ -596,7 +616,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         except Exception as e:
             log.error("处理异常: %s\n%s", e, traceback.format_exc())
             try:
-                _respond(f"❌ 生成失败: {str(e)[:200]}\n\n发送「帮助」查看说明")
+                _respond("❌ 生成失败，请稍后重试。\n\n发送「帮助」查看说明")
             except Exception:
                 pass
 
@@ -648,7 +668,7 @@ def main():
         log.info("连接飞书… (第 %d 次)", attempt)
         try:
             event_handler = (
-                EventDispatcherHandler.builder("", "")
+                EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
                 .register_p2_im_message_receive_v1(_handle_message)
                 .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_chat_entered)
                 .build()

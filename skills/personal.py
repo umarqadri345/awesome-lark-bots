@@ -54,6 +54,9 @@ class PersonalSkill(Skill):
         env_name = os.getenv("PERSONAL_PROFILE", "")
         if env_name:
             p = self.profiles_dir / env_name
+            resolved = p.resolve()
+            if not str(resolved).startswith(str(self.profiles_dir.resolve())):
+                return None
             if p.exists():
                 return p
             for ext in (".md", ".yaml", ".yml"):

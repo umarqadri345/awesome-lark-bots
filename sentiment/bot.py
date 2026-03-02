@@ -55,6 +55,9 @@ from sentiment.config.settings import (
     FEISHU_WEBHOOK_URL, JOA_BASE, ALL_PLATFORMS, PLATFORMS_DEFAULT, log,
 )
 
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
+
 # ── 日志 ─────────────────────────────────────────────────────
 
 _log_lock = threading.Lock()
@@ -411,6 +414,14 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         format_result_message(result),
                         next_actions=["再来一份报告", "加 +分析 看 AI 解读"],
                     ))
+                    try:
+                        from core.events import emit as _emit_event
+                        _emit_event("sentiment", "report_completed",
+                                    f"舆情报告完成: {profile['title']}",
+                                    user_id=uid or "",
+                                    meta={"profile_id": profile_id, "with_ai": with_ai})
+                    except Exception:
+                        pass
                 finally:
                     with _running_lock:
                         _running_sessions.pop(user_key, None)
@@ -442,6 +453,14 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         format_result_message(result),
                         next_actions=["换个关键词再采", "加 +分析 看 AI 解读"],
                     ))
+                    try:
+                        from core.events import emit as _emit_event
+                        _emit_event("sentiment", "report_completed",
+                                    f"采集完成: {', '.join(keywords[:3])}",
+                                    user_id=uid or "",
+                                    meta={"keywords": keywords[:5], "with_ai": with_ai})
+                    except Exception:
+                        pass
                 finally:
                     with _running_lock:
                         _running_sessions.pop(user_key, None)
@@ -485,10 +504,8 @@ RECONNECT_MULTIPLIER = 2
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_p2p_chat_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)

@@ -59,8 +59,13 @@ from creative.knowledge import (
     build_system_prompt, build_user_prompt, build_refine_prompt,
     build_chat_system_prompt, build_generate_from_chat_prompt,
     detect_brand_from_text,
+    build_exec_discuss_system_prompt, build_exec_brief_prompt,
+    build_extract_brief_info_prompt,
 )
 
+
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
 
 # ── 日志 ─────────────────────────────────────────────────────
 
@@ -145,9 +150,19 @@ def _format_single_shot_card(raw: str, brand_name: str) -> dict:
         sections.append({"text": "**配套文案**\n\n" + copywriting.strip()})
 
     sections.append({"divider": True})
-    sections.append({"note": f"品牌: {brand_name}  ·  发送「改一下：xxx」可调整  ·  发送新需求继续生成"})
+    sections.append({"note": f"品牌: {brand_name}  ·  「改一下：xxx」调整  ·  点击按钮或发「安排制作」落地执行"})
 
-    return _card("AI 素材 Prompt · 单镜头", sections, color="blue")
+    card = _card("AI 素材 Prompt · 单镜头", sections, color="blue")
+    card["elements"].insert(-1, {
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🎬 安排制作"},
+            "type": "primary",
+            "value": {"action": "start_exec_brief"},
+        }],
+    })
+    return card
 
 
 def _format_storyboard_card(raw: str, brand_name: str) -> dict:
@@ -175,10 +190,20 @@ def _format_storyboard_card(raw: str, brand_name: str) -> dict:
     shot_count = len(parts["shots"])
     sections.append({"note": (
         f"品牌: {brand_name}  ·  共 {shot_count} 个 Shot  ·  "
-        "按编号逐个在 Seedance 中生成，最后剪辑拼接"
+        "点击按钮或发「安排制作」落地执行"
     )})
 
-    return _card(f"AI 素材 Prompt · {shot_count} 镜分镜", sections, color="purple")
+    card = _card(f"AI 素材 Prompt · {shot_count} 镜分镜", sections, color="purple")
+    card["elements"].insert(-1, {
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🎬 安排制作"},
+            "type": "primary",
+            "value": {"action": "start_exec_brief"},
+        }],
+    })
+    return card
 
 
 def _split_storyboard(raw: str) -> dict:
@@ -320,8 +345,13 @@ def _get_session(user_key: str) -> dict:
             "brand": None,          # 当前品牌 profile（dict 或 None）
             "last_result": None,    # 上次生成的 prompt 文本（用于「改一下」）
             "brand_name": "",       # 品牌名（显示用），空=通用
-            "mode": "direct",       # 当前模式：direct（直接生成）| chat（讨论中）
+            "mode": "direct",       # direct | chat | exec_discuss | exec_pending_confirm
             "chat_history": [],     # 讨论模式的对话历史
+            "exec_ai_prompt": "",   # 触发执行讨论的 AI prompt
+            "exec_chat_history": [],  # 执行讨论的对话历史
+            "exec_doc_id": None,    # 执行Brief 文档 ID
+            "exec_doc_url": None,   # 执行Brief 文档 URL
+            "exec_brief_content": "",  # 生成的Brief内容（读取文档的 fallback）
         }
         _sessions[user_key] = session
         while len(_sessions) > _MAX_SESSIONS:
@@ -390,21 +420,43 @@ _EXIT_CHAT_TRIGGERS = {
     "退出讨论", "结束讨论", "不聊了", "算了",
 }
 
+_EXEC_START_TRIGGERS = {
+    "安排制作", "落地执行", "提需求",
+}
+
+_EXEC_GEN_TRIGGERS = {
+    "可以了", "信息够了", "差不多了", "生成brief", "生成 brief",
+    "生成执行brief", "出brief", "出 brief", "生成",
+}
+
+_EXEC_SUBMIT_TRIGGERS = {
+    "确认提交", "提交需求",
+}
+
+_EXEC_CANCEL_TRIGGERS = {
+    "取消制作", "退出制作", "不做了", "取消",
+}
+
 
 def _classify_input(text: str, mode: str = "direct") -> tuple:
     """
     将用户输入分类为具体操作类型。
 
-    根据当前模式(direct/chat)和输入内容，判断用户意图：
+    根据当前模式和输入内容，判断用户意图：
       ('help',)            → 查看帮助
-      ('greet',)           → 打招呼，回复欢迎卡片
+      ('greet',)           → 打招呼
       ('brand', arg)       → 查看/切换品牌
-      ('refine', feedback)  → 修改上次的 prompt
+      ('refine', feedback) → 修改上次的 prompt
       ('generate', text)   → 直接生成 prompt（仅 direct 模式）
-      ('chat_start', text) → 开始创意讨论（从 direct 进入 chat）
-      ('chat_msg', text)   → 讨论中继续对话（chat 模式下的普通消息）
+      ('chat_start', text) → 开始创意讨论
+      ('chat_msg', text)   → 讨论中继续对话
       ('confirm',)         → 确认从讨论生成 prompt
       ('exit_chat',)       → 退出讨论模式
+      ('exec_start',)      → 开始执行讨论
+      ('exec_msg', text)   → 执行讨论中的消息
+      ('exec_gen_brief',)  → 生成执行Brief
+      ('exec_submit',)     → 确认提交需求
+      ('exec_cancel',)     → 取消执行流程
     """
     t = text.strip()
     lower = t.lower().rstrip("!！~")
@@ -414,6 +466,20 @@ def _classify_input(text: str, mode: str = "direct") -> tuple:
 
     if lower in _GREETING_WORDS:
         return ("greet",)
+
+    # ── 执行模式（优先处理）
+    if mode in ("exec_discuss", "exec_pending_confirm"):
+        if lower in _EXEC_CANCEL_TRIGGERS:
+            return ("exec_cancel",)
+        if mode == "exec_discuss" and lower in _EXEC_GEN_TRIGGERS:
+            return ("exec_gen_brief",)
+        if mode == "exec_pending_confirm" and lower in _EXEC_SUBMIT_TRIGGERS:
+            return ("exec_submit",)
+        return ("exec_msg", t)
+
+    # ── 安排制作入口
+    if lower in _EXEC_START_TRIGGERS:
+        return ("exec_start",)
 
     for prefix in _BRAND_PREFIXES:
         if lower == prefix.rstrip("：:"):
@@ -590,6 +656,248 @@ def _do_brand(user_key: str, arg: str) -> dict:
         ], color="orange")
 
 
+# ── 执行落地 ─────────────────────────────────────────────────
+
+_MAX_EXEC_CHAT_HISTORY = 20
+
+
+def _start_exec_discuss(user_key: str, uid: Optional[str], mid: Optional[str], ai_prompt: str) -> None:
+    """开始执行讨论流程。"""
+    session = _get_session(user_key)
+    brand = session.get("brand")
+
+    _update_session(user_key,
+        mode="exec_discuss",
+        exec_ai_prompt=ai_prompt,
+        exec_chat_history=[],
+        exec_doc_id=None,
+        exec_doc_url=None,
+        exec_brief_content="",
+    )
+
+    system = build_exec_discuss_system_prompt(brand, ai_prompt)
+    initial = "我想把这个AI创意概念落地执行。"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial},
+    ]
+
+    result = chat_completion(provider="deepseek", messages=messages, temperature=0.7)
+
+    history = [
+        {"role": "user", "content": initial},
+        {"role": "assistant", "content": result},
+    ]
+    _update_session(user_key, exec_chat_history=history)
+
+    card = _card("🎬 执行讨论", [
+        {"text": result},
+        {"divider": True},
+        {"note": "执行讨论中  ·  继续回答  ·  发「可以了」生成执行Brief  ·  发「取消」退出"},
+    ], color="green")
+
+    if mid:
+        reply_card(mid, card)
+    elif uid:
+        send_card_to_user(uid, card)
+
+
+def _do_exec_chat(user_key: str, uid: Optional[str], mid: str, user_input: str) -> None:
+    """执行讨论中的对话。"""
+    session = _get_session(user_key)
+    brand = session.get("brand")
+    ai_prompt = session.get("exec_ai_prompt", "")
+
+    history = list(session.get("exec_chat_history", []))
+    history.append({"role": "user", "content": user_input})
+    if len(history) > _MAX_EXEC_CHAT_HISTORY:
+        history = history[-_MAX_EXEC_CHAT_HISTORY:]
+
+    system = build_exec_discuss_system_prompt(brand, ai_prompt, user_text=user_input)
+    messages = [{"role": "system", "content": system}] + history
+
+    result = chat_completion(provider="deepseek", messages=messages, temperature=0.7)
+
+    history.append({"role": "assistant", "content": result})
+    _update_session(user_key, exec_chat_history=history)
+
+    card = _card("🎬 执行讨论", [
+        {"text": result},
+        {"divider": True},
+        {"note": "执行讨论中  ·  继续回答  ·  发「可以了」生成执行Brief  ·  发「取消」退出"},
+    ], color="green")
+    reply_card(mid, card)
+
+
+def _do_generate_exec_brief(user_key: str, uid: Optional[str], mid: str) -> None:
+    """从执行讨论生成Brief云文档。"""
+    session = _get_session(user_key)
+    ai_prompt = session.get("exec_ai_prompt", "")
+    history = session.get("exec_chat_history", [])
+
+    if not history:
+        reply_card(mid, _card("没有讨论内容", [
+            {"text": "请先进行执行讨论，再生成Brief。"},
+        ], color="orange"))
+        return
+
+    reply_card(mid, _card("正在生成执行Brief…", [
+        {"text": "根据讨论内容生成Brief文档中"},
+        {"note": "通常需要 15-30 秒"},
+    ], color="indigo"))
+
+    discussion = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+        for m in history
+    )
+
+    brief_prompt = build_exec_brief_prompt(discussion, ai_prompt)
+    brief_content = chat_completion(
+        provider="deepseek",
+        system="你是一个专业的素材需求Brief撰写助手。请用Markdown格式输出。",
+        user=brief_prompt,
+        temperature=0.5,
+    )
+
+    if not brief_content:
+        reply_message(mid, "生成Brief失败，请稍后重试。")
+        return
+
+    from core.feishu_client import create_document_with_content
+
+    brand = session.get("brand")
+    brand_name = brand.get("name", "") if brand else ""
+    doc_title = f"素材执行Brief - {brand_name or '创意素材'}"
+
+    ok, url_or_err = create_document_with_content(doc_title, brief_content, owner_open_id=uid)
+
+    if ok:
+        doc_url = url_or_err
+        doc_id = ""
+        if "/docx/" in doc_url:
+            doc_id = doc_url.split("/docx/")[-1].split("?")[0].split("/")[0]
+
+        _update_session(user_key,
+            mode="exec_pending_confirm",
+            exec_doc_id=doc_id,
+            exec_doc_url=doc_url,
+            exec_brief_content=brief_content,
+        )
+
+        card = _card("📝 执行Brief已生成", [
+            {"text": f"请查看并修改Brief文档：\n\n👉 [点击打开文档]({doc_url})"},
+            {"divider": True},
+            {"text": "修改完毕后发「**确认提交**」录入素材管理表\n发「**取消**」退出"},
+        ], color="green")
+    else:
+        _update_session(user_key,
+            mode="exec_pending_confirm",
+            exec_doc_id=None,
+            exec_doc_url=None,
+            exec_brief_content=brief_content,
+        )
+
+        card = _card("📝 执行Brief（文档创建失败，内容如下）", [
+            {"text": brief_content[:2000]},
+            {"divider": True},
+            {"text": "发「**确认提交**」录入素材管理表\n发「**取消**」退出"},
+        ], color="orange")
+
+    if uid:
+        send_card_to_user(uid, card)
+    else:
+        reply_card(mid, card)
+
+
+def _do_submit_asset_request(user_key: str, uid: Optional[str], mid: str) -> None:
+    """确认提交素材需求到管理表。"""
+    session = _get_session(user_key)
+    doc_id = session.get("exec_doc_id")
+    brief_content = session.get("exec_brief_content", "")
+    doc_url = session.get("exec_doc_url", "")
+
+    reply_card(mid, _card("正在提交需求…", [
+        {"text": "读取Brief并录入素材管理表"},
+    ], color="indigo"))
+
+    if doc_id:
+        from core.feishu_client import read_document_content
+        ok, content = read_document_content(doc_id)
+        if ok and content:
+            brief_content = content
+
+    if not brief_content:
+        reply_message(mid, "无法读取Brief内容，请重新生成。")
+        _update_session(user_key, mode="direct")
+        return
+
+    extract_prompt = build_extract_brief_info_prompt(brief_content)
+    raw_json = chat_completion(
+        provider="deepseek",
+        system="你是一个JSON数据提取助手。只返回JSON，不要其他文字。",
+        user=extract_prompt,
+        temperature=0.1,
+    )
+
+    info = {}
+    try:
+        json_match = re.search(r'\{.*\}', raw_json, re.DOTALL)
+        if json_match:
+            info = json.loads(json_match.group())
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    from creative.asset_tracker import (
+        submit_asset_request, sync_to_assistant, get_management_table_url,
+    )
+
+    ok, req_id_or_err = submit_asset_request(info, brief_url=doc_url, owner_open_id=uid)
+
+    if not ok:
+        _log(f"提交素材需求失败: {req_id_or_err}")
+        reply_card(mid, _card("提交失败", [
+            {"text": "录入管理表时出错，请稍后重试。"},
+            {"text": "发「**确认提交**」重试"},
+        ], color="red"))
+        return
+
+    req_id = req_id_or_err
+
+    sync_ok, _ = sync_to_assistant(info, brief_url=doc_url)
+    table_url = get_management_table_url()
+
+    _update_session(user_key,
+        mode="direct",
+        exec_ai_prompt="",
+        exec_chat_history=[],
+        exec_doc_id=None,
+        exec_doc_url=None,
+        exec_brief_content="",
+    )
+
+    sections = [
+        {"text": f"需求已提交！编号：**{req_id}**"},
+    ]
+    if table_url:
+        sections.append({"text": f"📊 [查看素材需求管理表]({table_url})"})
+    if doc_url:
+        sections.append({"text": f"📝 [查看执行Brief]({doc_url})"})
+    sections.append({"divider": True})
+
+    notes = []
+    if sync_ok:
+        notes.append("已同步到助理项目表")
+    notes.append("素材对接人可在管理表中更新进度")
+    sections.append({"note": "  ·  ".join(notes)})
+
+    card = _card("需求已提交", sections, color="green")
+
+    if uid:
+        send_card_to_user(uid, card)
+    else:
+        reply_card(mid, card)
+
+
 # ── 消息处理 ─────────────────────────────────────────────────
 
 _running: dict[str, bool] = {}
@@ -649,6 +957,100 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_card(mid, _card("已退出讨论", [
                     {"text": "讨论内容已清空。直接发送需求即可生成 prompt。"},
                 ], color="blue"))
+                return
+
+            # ── 执行模式：取消
+            if action[0] == "exec_cancel":
+                _update_session(user_key, mode="direct", exec_ai_prompt="",
+                    exec_chat_history=[], exec_doc_id=None, exec_doc_url=None,
+                    exec_brief_content="")
+                reply_card(mid, _card("已退出制作流程", [
+                    {"text": "已退出执行讨论。可以继续生成AI prompt，或发「安排制作」重新开始。"},
+                ], color="blue"))
+                return
+
+            # ── 开始执行讨论
+            if action[0] == "exec_start":
+                if not session.get("last_result"):
+                    reply_card(mid, _card("没有可执行的AI prompt", [
+                        {"text": "请先发送素材需求，生成一个AI prompt后再安排制作。"},
+                    ], color="orange"))
+                    return
+                with _running_lock:
+                    if _running.get(user_key):
+                        reply_message(mid, "上一个请求还在处理中，请稍等...")
+                        return
+                    _running[user_key] = True
+                try:
+                    _start_exec_discuss(user_key, uid, mid, session["last_result"])
+                except Exception as e:
+                    _log(f"开始执行讨论异常: {e}\n{traceback.format_exc()}")
+                    reply_message(mid, "启动执行讨论出错，请稍后重试")
+                finally:
+                    with _running_lock:
+                        _running.pop(user_key, None)
+                return
+
+            # ── 执行讨论中的消息
+            if action[0] == "exec_msg" and current_mode == "exec_discuss":
+                with _running_lock:
+                    if _running.get(user_key):
+                        reply_message(mid, "上一个请求还在处理中，请稍等...")
+                        return
+                    _running[user_key] = True
+                try:
+                    _do_exec_chat(user_key, uid, mid, action[1])
+                except Exception as e:
+                    _log(f"执行讨论异常: {e}\n{traceback.format_exc()}")
+                    reply_message(mid, "讨论出错，请稍后重试")
+                finally:
+                    with _running_lock:
+                        _running.pop(user_key, None)
+                return
+
+            # ── 生成执行Brief
+            if action[0] == "exec_gen_brief":
+                with _running_lock:
+                    if _running.get(user_key):
+                        reply_message(mid, "上一个请求还在处理中，请稍等...")
+                        return
+                    _running[user_key] = True
+                try:
+                    _do_generate_exec_brief(user_key, uid, mid)
+                except Exception as e:
+                    _log(f"生成Brief异常: {e}\n{traceback.format_exc()}")
+                    reply_message(mid, "生成Brief出错，请稍后重试")
+                finally:
+                    with _running_lock:
+                        _running.pop(user_key, None)
+                return
+
+            # ── 确认提交需求
+            if action[0] == "exec_submit":
+                with _running_lock:
+                    if _running.get(user_key):
+                        reply_message(mid, "上一个请求还在处理中，请稍等...")
+                        return
+                    _running[user_key] = True
+                try:
+                    _do_submit_asset_request(user_key, uid, mid)
+                except Exception as e:
+                    _log(f"提交需求异常: {e}\n{traceback.format_exc()}")
+                    reply_message(mid, "提交出错，请稍后重试")
+                finally:
+                    with _running_lock:
+                        _running.pop(user_key, None)
+                return
+
+            # ── 等待确认阶段的其他消息
+            if action[0] == "exec_msg" and current_mode == "exec_pending_confirm":
+                doc_url = session.get("exec_doc_url", "")
+                sections = []
+                if doc_url:
+                    sections.append({"text": f"👉 [打开Brief文档]({doc_url})"})
+                sections.append({"text": "📝 Brief文档已生成，请查看并修改后发「**确认提交**」。"})
+                sections.append({"note": "发「取消」退出制作流程"})
+                reply_card(mid, _card("等待确认", sections, color="green"))
                 return
 
             # ── 确认生成（从讨论中生成）
@@ -794,6 +1196,14 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         send_card_to_user(uid, card)
                     else:
                         reply_card(mid, card)
+                try:
+                    from core.events import emit as _emit_event
+                    _emit_event("creative", "prompt_generated",
+                                f"Prompt 生成完成 ({brand_name})",
+                                user_id=uid or "",
+                                meta={"brand": brand_name, "len": len(result or "")})
+                except Exception:
+                    pass
                 _log(f"生成完成: user={user_key[:20]} len={len(result or '')}")
             except Exception as e:
                 _log(f"生成异常: {e}\n{traceback.format_exc()}")
@@ -831,6 +1241,7 @@ def _help_card() -> dict:
             "- 「**品牌**」→ 查看/切换当前品牌\n"
             "- 「**品牌：sky**」→ 切换到指定品牌\n"
             "- 「**生成**」→ 讨论后确认生成 prompt\n"
+            "- 「**安排制作**」→ 将AI概念落地为执行Brief并提交需求\n"
             "- 「**退出讨论**」→ 结束当前讨论\n"
             "- 「**帮助**」→ 本说明"
         )},
@@ -872,6 +1283,67 @@ def _handle_message_read(_data) -> None:
     pass
 
 
+# ── 卡片操作 ─────────────────────────────────────────────────
+
+def _handle_card_action(data) -> dict:
+    """处理卡片按钮点击事件（如「安排制作」）。"""
+    _log("收到卡片操作事件")
+    try:
+        action_value = {}
+        open_id = ""
+
+        if hasattr(data, 'action'):
+            action_value = getattr(data.action, 'value', {}) or {}
+        elif isinstance(data, dict):
+            action_value = (data.get('action') or {}).get('value', {})
+
+        if hasattr(data, 'open_id'):
+            open_id = data.open_id or ""
+        elif isinstance(data, dict):
+            open_id = data.get('open_id', '')
+
+        if isinstance(action_value, str):
+            try:
+                action_value = json.loads(action_value)
+            except (json.JSONDecodeError, TypeError):
+                action_value = {}
+
+        action_name = action_value.get("action", "") if isinstance(action_value, dict) else ""
+        _log(f"卡片操作: action={action_name} open_id={open_id[:20]}")
+
+        if action_name == "start_exec_brief" and open_id:
+            threading.Thread(
+                target=_start_exec_brief_from_card,
+                args=(open_id,),
+                daemon=True,
+            ).start()
+            return {"toast": {"type": "info", "content": "正在进入执行讨论…"}}
+
+        return {}
+    except Exception as e:
+        _log(f"卡片操作异常: {e}\n{traceback.format_exc()}")
+        return {}
+
+
+def _start_exec_brief_from_card(open_id: str) -> None:
+    """从卡片按钮触发的执行讨论入口。"""
+    try:
+        session = _get_session(open_id)
+        ai_prompt = session.get("last_result", "")
+        if not ai_prompt:
+            send_card_to_user(open_id, _card("没有可执行的AI prompt", [
+                {"text": "请先生成一个AI素材prompt，然后再安排制作。"},
+            ], color="orange"))
+            return
+        _start_exec_discuss(open_id, open_id, None, ai_prompt)
+    except Exception as e:
+        _log(f"卡片触发执行讨论异常: {e}\n{traceback.format_exc()}")
+        try:
+            send_message_to_user(open_id, "启动执行讨论出错，请发「安排制作」重试。")
+        except Exception:
+            pass
+
+
 # ── 长连接 ───────────────────────────────────────────────────
 
 RECONNECT_INITIAL_DELAY = 5
@@ -880,21 +1352,32 @@ RECONNECT_MULTIPLIER = 2
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_p2p_chat_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)
         .build()
     )
-    cli = lark.ws.Client(
-        app_id, app_secret,
+
+    card_handler = None
+    try:
+        card_handler = lark.CardActionHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY).event_handler(
+            _handle_card_action
+        ).build()
+        _log("卡片操作处理器已注册")
+    except Exception as e:
+        _log(f"卡片操作处理器初始化失败（发「安排制作」仍可触发）: {e}")
+
+    cli_kwargs = dict(
         event_handler=event_handler,
         log_level=LogLevel.DEBUG,
         domain="https://open.feishu.cn",
     )
+    if card_handler:
+        cli_kwargs["card_handler"] = card_handler
+
+    cli = lark.ws.Client(app_id, app_secret, **cli_kwargs)
     cli.start()
 
 

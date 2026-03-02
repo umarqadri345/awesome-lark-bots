@@ -95,7 +95,11 @@ def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tup
         system = enrich_prompt(system, user_text=user_msg, bot_type="planner")
     except Exception:
         pass
-    return chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+    try:
+        return chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+    except Exception as e:
+        print(f"[规划] 第{step_num}步 LLM 调用失败: {e}", flush=True)
+        return f"（第{step_num}步生成失败，请稍后重试）"
 
 
 def _judge_search_need(topic: str, context: str) -> dict:
@@ -108,7 +112,12 @@ def _judge_search_need(topic: str, context: str) -> dict:
         raw = chat_completion(
             provider=PROVIDER, system=SEARCH_JUDGE_SYSTEM, user=user_msg,
         ).strip()
-        raw = raw.strip("`").removeprefix("json").strip()
+        import re as _re
+        m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
+        if m:
+            raw = m.group(1)
+        else:
+            raw = raw.strip("`").removeprefix("json").strip()
         return _json.loads(raw)
     except Exception as e:
         print(f"[搜索判断] 解析失败: {e}", flush=True)
@@ -209,11 +218,21 @@ _DOC_QUALITY_SUFFIX = """
 请根据以上规划分析生成文档。质量要求：
 - 只写这个具体项目的内容，不要输出套在任何项目上都成立的通用句子
 - 每句话删掉后如果不影响理解，说明这句话是废话，不要写
-- 数字、时间、地点、人要具体，不要用"相关""适当""一定程度"等模糊词"""
+- 数字、时间、地点、人要具体，不要用"相关""适当""一定程度"等模糊词
+- 方案描述要讲清楚核心机制（怎么运作、凭什么能行），不是口号
+- 风险和卡点要写这个项目特有的，不要写所有项目都会遇到的通用风险"""
 
 
-def generate_doc(doc_type: str, topic: str, planning_outputs: list[tuple[int, str, str]]) -> tuple[str, str]:
+def generate_doc(
+    doc_type: str,
+    topic: str,
+    planning_outputs: list[tuple[int, str, str]],
+    audience: str = "",
+) -> tuple[str, str]:
     """根据规划输出生成指定类型的可交付文档。
+
+    Args:
+        audience: 可选受众描述（如"给老板看""给执行团队"），影响内容深度和表述。
 
     Returns: (content, format) — format 为 "doc" 或 "sheet"。
     """
@@ -222,6 +241,8 @@ def generate_doc(doc_type: str, topic: str, planning_outputs: list[tuple[int, st
         return f"不支持的文档类型: {doc_type}", "doc"
     fmt = cfg.get("format", "doc")
     system = cfg["system"]
+    if audience:
+        system += f"\n\n受众：这份文档的读者是「{audience}」，请调整内容深度和表述方式以适配受众。"
     try:
         from core.skill_router import enrich_prompt
         system = enrich_prompt(system, user_text=topic, bot_type="planner")
@@ -233,6 +254,18 @@ def generate_doc(doc_type: str, topic: str, planning_outputs: list[tuple[int, st
     user_msg = "\n\n".join(context_parts)
     user_msg += _DOC_QUALITY_SUFFIX
     content = chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+
+    if fmt == "doc":
+        try:
+            from planner.prompts import DOC_SELF_REVIEW_SYSTEM
+            content = chat_completion(
+                provider=PROVIDER,
+                system=DOC_SELF_REVIEW_SYSTEM,
+                user=f"文档类型：{cfg['name']}\n规划主题：{topic}\n\n---\n\n{content}",
+            ).strip()
+        except Exception as e:
+            print(f"[文档自审] 失败，使用原始版本: {e}", flush=True)
+
     return content, fmt
 
 
@@ -323,7 +356,11 @@ def run_planning(
     session_content = "\n".join(session_lines)
     path = save_session(session_content, f"{ts}_planning")
     print(f"[保存] 规划已写入 {path}", flush=True)
-    send_planner_card("规划完成", f"完整内容已保存至 `{path}`", color="green")
+    send_planner_card(
+        "规划完成",
+        f"完整内容已保存至 `{path}`\n\n💬 私聊 planner bot 可追问规划内容或生成文档",
+        color="green",
+    )
     print("\n========== 规划结束 ==========", flush=True)
     return str(path), previous_outputs
 

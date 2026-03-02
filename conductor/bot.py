@@ -60,6 +60,9 @@ from conductor.pipeline import run_pipeline, PipelineRun
 from conductor.scheduler import Scheduler
 
 
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
+
 # ── 日志 ──────────────────────────────────────────────────────
 
 _log_lock = threading.Lock()
@@ -348,6 +351,15 @@ def _dispatch(mid: str, text: str, uid: Optional[str], user_key: str):
                 send_card_to_user(uid, card)
             else:
                 reply_card(mid, card)
+            try:
+                from core.events import emit as _emit_event
+                _title = run.selected_idea.title[:40] if run.selected_idea else topic[:40]
+                _emit_event("conductor", "pipeline_completed",
+                            f"内容已生成: {_title}",
+                            user_id=uid or "",
+                            meta={"run_id": run.run_id, "topic": topic[:100]})
+            except Exception:
+                pass
 
         except Exception as e:
             _log(f"Pipeline 异常: {e}\n{traceback.format_exc()}")
@@ -488,7 +500,8 @@ def _cmd_schedule(mid: str, text: str):
         else:
             reply_message(mid, f"设置失败：内容 {content_id} 不存在或状态不允许")
     except Exception as e:
-        reply_message(mid, f"时间解析失败: {e}")
+        _log(f"定时发布时间解析失败: {e}\n{traceback.format_exc()}")
+        reply_message(mid, "时间解析失败，请检查格式。\n支持格式：10:00 或 2026-03-01 10:00")
 
 
 def _cmd_auto_publish(mid: str, content_id: str, platform: str):
@@ -592,8 +605,9 @@ def _cmd_content_goals(mid: str, user_key: str, goals: str):
 
 def _format_result_card(run: PipelineRun) -> dict:
     if run.status == "failed":
+        _log(f"Pipeline 执行失败: {run.error}")
         return _card("Pipeline 执行失败", [
-            {"text": f"错误：{run.error}"},
+            {"text": "内部错误，请稍后重试。"},
             {"note": "检查 API 配置后重试"},
         ], color="red")
 
@@ -738,10 +752,8 @@ def _handle_message_read(_data) -> None:
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)

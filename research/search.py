@@ -14,10 +14,23 @@ research/search.py — 联网搜索工具层
 
 import os
 import logging
+from urllib.parse import urlparse
 
 import requests as _requests
 
 log = logging.getLogger("research")
+
+
+def _is_private_host(hostname: str) -> bool:
+    """Block requests to private/loopback addresses to prevent SSRF."""
+    import ipaddress
+    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return False
 
 
 # ── Tavily（推荐） ──────────────────────────────────────────
@@ -136,6 +149,11 @@ def _ddgs_news(query: str, max_results: int = 5) -> list[dict]:
 
 def fetch_url(url: str, max_chars: int = 8000) -> str:
     """抓取网页并提取正文，用于深入阅读搜索结果。"""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    if parsed.hostname and _is_private_host(parsed.hostname):
+        return ""
     try:
         resp = _requests.get(
             url,

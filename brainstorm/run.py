@@ -28,6 +28,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -41,7 +42,7 @@ from core.llm import chat_completion, get_model_for_role
 from core.utils import load_context, run_timestamp, save_session, truncate_for_display
 from skills import load_context as load_skill_context
 
-def _send_brainstorm_card(title: str, content: str, color: str = "blue", webhook_override: str | None = None) -> bool:
+def _send_brainstorm_card(title: str, content: str, color: str = "blue", webhook_override: Optional[str] = None) -> bool:
     # 优先使用调用方传入的 webhook（脑暴机器人 vs 自媒体助手 分群推送）
     if webhook_override:
         webhook = webhook_override.strip()
@@ -420,12 +421,70 @@ def get_role_display(role: str) -> tuple:
     return display_fn(role)
 
 
+# ── 质量关卡 ─────────────────────────────────────────────────
+# 第 1、2 轮结束后，由独立 critic 评估本轮产出质量。
+# 逐个方向打分，标记「水货」并说明原因，结果注入下一轮上下文。
+
+_QUALITY_GATE_SYSTEM = """你是脑暴质量关卡评审员（Quality Gate Critic）。你刚看完一轮 AI 多角色脑暴讨论。
+
+你的唯一任务：逐个审查本轮提出的每个创意方向，标记哪些是「水货」（表面好听但实际空洞）。
+
+「水货」的典型特征（命中任何一条即判定）：
+- 万金油概念：换个品牌/话题也成立，没有针对性（如「沉浸式体验」「打造社交货币」「限定快闪」）
+- 模糊体验：说不清参与者在哪个具体瞬间做什么、感受到什么
+- 已被用烂：这种玩法/形式在近两年已经被大量品牌做过（如盲盒、打卡墙、联名周边）
+- 伪创新：只是把旧形式换了个名字或包装（如把快闪店叫「体验空间」）
+- 无传播锚点：想不出参与者会发什么样的朋友圈/短视频
+- 逻辑跳跃：从洞察到创意之间缺乏因果关系，硬凑的
+
+输出格式（严格遵守）：
+逐个方向评价，每个方向用一行：
+⚠️ [方向名称]：水货 — [一句话原因]
+✅ [方向名称]：过关 — [一句话亮点]
+
+最后输出「下一轮行动指令」，根据过关比例分三档：
+- 过关数 ≥ 4：下一轮聚焦打磨 [过关方向]，直接淘汰 [水货方向]。
+- 过关数 1-3：下一轮必须做两件事——(1) 打磨这几个过关方向 (2) 针对水货方向的失败原因，提出全新替代方向（不是修修补补，是重新想）。
+- 过关数 = 0：上一轮全军覆没。下一轮必须回到原点重新发散，不要在上一轮的框架里打转。重点反思：上一轮为什么全是水货？是主题理解偏了，还是思路被某个套路带跑了？从用户真实痛点重新出发。
+
+要求：
+- 宁可误杀不可放过——「还行」也算水货
+- 必须使用中文
+- 不要解释评审标准，直接给结论"""
+
+_QUALITY_GATE_R2_EXTRA = """
+额外要求（第二轮专用）：
+本轮的目标是把方向具体化为可执行体验。对每个方向还需检查：
+- 体验旅程是否完整（有头有尾，不是只有一个模糊的高潮点）
+- 成本/可行性是否被认真考虑过
+- 传播路径是否具体到「用户会发一条什么」
+任何一项说不清，判水货。"""
+
+
+def _run_quality_gate(full_round_text: str, round_num: int, topic_type: str) -> str:
+    """运行质量关卡评估，返回 critic 评审结果文本。"""
+    system = _QUALITY_GATE_SYSTEM
+    if round_num == 2:
+        system += _QUALITY_GATE_R2_EXTRA
+
+    user = (
+        f"以下是第{round_num}轮讨论的全部发言，请逐个审查其中提出的每个创意方向：\n\n"
+        f"{full_round_text}"
+    )
+    try:
+        result = chat_completion(provider="deepseek", system=system, user=user, temperature=0.3)
+        return f"━━ 第{round_num}轮质量关卡 ━━\n{result.strip()}"
+    except Exception as e:
+        print(f"  [质量关卡] 评估失败: {e}", flush=True)
+        return ""
+
+
 # ── 单轮执行 ────────────────────────────────────────────────
 # 一轮讨论的流程：
 # 1. 构建上下文（主题 + 背景 + 之前各轮摘要 + 当前轮次目标 + 风格约束）
-# 2. 5 个角色按顺序发言，每人看到前 3 个人的发言并回应
+# 2. 5 个角色按顺序发言，每人看到所有前面角色的发言并回应
 # 3. 每人发言完毕后推送到飞书群
-# 4. 全部发言完成后，用 AI 生成本轮摘要
+# 4. 全部发言完成后，用 AI 生成本轮摘要 + 质量关卡评估
 
 def run_round(
     round_num: int,
@@ -435,7 +494,7 @@ def run_round(
     round_summaries: list[str],
     ts: str,
     brand_context: str = "",
-    webhook_override: str | None = None,
+    webhook_override: Optional[str] = None,
     topic_type: str = "campaign",
 ) -> tuple[list[str], str]:
     ROLES, display_fn, round_names, round_goals, is_v3 = _get_roles_and_config()
@@ -522,6 +581,17 @@ def run_round(
             "聚焦：每个方向的具体行动计划——第一步做什么、什么时候做、怎么知道有没有效、卡住了怎么办。"
         )
 
+    if is_v3 and round_num in (1, 2):
+        parts.append(
+            "【反面案例——以下是典型的水货思路，你必须主动避开】\n"
+            "❌「打造沉浸式 XX 体验空间」— 万金油概念，换个品牌也能说，没有具体的峰值瞬间\n"
+            "❌「推出限定联名周边/盲盒」— 近两年被做烂了，零新颖性\n"
+            "❌「设置互动打卡墙/拍照装置」— 流量逻辑而非体验逻辑，参与者拍完就忘\n"
+            "❌「线上线下联动/O2O 闭环」— 抽象框架不是创意，说不清用户到底做了什么\n"
+            "❌ 把技术（AR/AI/互动屏等）或资源（KOL/KOC/明星等）当作创意本身 — 技术和资源是手段不是体验，必须说清楚「用这个手段之后，参与者具体会做什么、感受到什么」，否则就是偷懒\n"
+            "如果你发现自己正在想上述类型的东西，立刻停下来，从「参与者在某个具体的 5 秒内会做什么、感受到什么」重新想。"
+        )
+
     if not is_v3:
         parts.append("【约束】方案需符合游戏调性与 IP，但优先做游戏外、社媒上、线下、现实场景的体验；这类体验由市场团队更可控、更好落地。")
     base_context = "\n\n".join(parts)
@@ -533,15 +603,15 @@ def run_round(
         cn_name, cn_role = display_fn(role)
         print(f"    [{idx}/{n_roles}] {cn_name}（{cn_role}）发言中...", flush=True)
         system = load_system_prompt(role)
-        recent = messages_this_round[-3:] if messages_this_round else []
+        prior_msgs = messages_this_round if messages_this_round else []
         speak_instruction = (
             "轮到你发言了。用自然群聊体回复，简约精炼，最多 3～4 段短段。"
             "可用 **加粗** 标记关键词，可用 → 或 - 引导要点，但不要写长列表。"
             "信息密度要高——每段必须包含具体判断或信息，不允许空话套话。"
         )
-        if recent:
-            prior_block = "【本轮前面几个人刚说的——你必须回应其中至少一位的观点（同意+补充具体内容 或 反对+理由），禁止忽略前面的发言自说自话】\n\n"
-            for r, m in recent:
+        if prior_msgs:
+            prior_block = "【本轮所有人目前的发言——你必须回应其中至少一位的观点（同意+补充具体内容 或 反对+理由），禁止忽略前面的发言自说自话】\n\n"
+            for r, m in prior_msgs:
                 pn, pr = display_fn(r)
                 prior_block += f"{pn}（{pr}）：\n{m}\n\n"
             user = base_context + "\n\n" + prior_block + speak_instruction
@@ -551,7 +621,11 @@ def run_round(
             user += " 最后必须附上完整的 Claude Code Handoff Pack（A 决策与理由、B 行动清单、C 可复制块）。"
 
         provider = get_model_for_role(role)
-        raw = chat_completion(provider=provider, system=system, user=user)
+        try:
+            raw = chat_completion(provider=provider, system=system, user=user)
+        except Exception as e:
+            print(f"    [{idx}/{n_roles}] {cn_name} LLM 调用失败: {e}", flush=True)
+            raw = "(该角色暂时无法发言)"
         display = truncate_for_display(raw)
         messages_this_round.append((role, display))
 
@@ -576,6 +650,22 @@ def run_round(
     )
     round_summary = truncate_for_display(round_summary)
     print(f"  [第{round_num}轮] 摘要完成", flush=True)
+
+    # ── 质量关卡：第 1、2 轮结束后由 critic 评估，标记弱方向 ──
+    if is_v3 and round_num in (1, 2):
+        print(f"  [第{round_num}轮] 质量关卡评估中...", flush=True)
+        critic_verdict = _run_quality_gate(full_round_text, round_num, topic_type)
+        if critic_verdict:
+            round_summary += "\n\n" + critic_verdict
+            _send_brainstorm_card(
+                f"第{round_num}轮 质量关卡",
+                truncate_for_display(critic_verdict),
+                color="red",
+                webhook_override=webhook_override,
+            )
+            time.sleep(FEISHU_INTERVAL)
+            print(f"  [第{round_num}轮] 质量关卡完成", flush=True)
+
     return messages_this_round, round_summary
 
 
@@ -586,15 +676,27 @@ def run_round(
 # 3. Kimi 根据 4 轮摘要生成最终交付物（讨论总结 + Claude Code prompt + 视觉 prompt）
 # 4. 保存完整 session 到 runs/ 目录
 
+class BrainstormResult(str):
+    """脑暴结果：str(result) 返回 session 文件路径（兼容旧调用方），
+    同时携带 round_summaries / final_output / topic_refined 等结构化数据。"""
+
+    def __new__(cls, path: str, **kwargs):
+        obj = super().__new__(cls, path)
+        obj.round_summaries: list[str] = kwargs.get("round_summaries", [])
+        obj.final_output: str = kwargs.get("final_output", "")
+        obj.topic_refined: str = kwargs.get("topic_refined", "")
+        return obj
+
+
 def run_brainstorm(
     topic: str,
     context: str = "",
     deliverables: str = "",
     no_refine: bool = False,
     brand: str = "",
-    webhook: str | None = None,
-) -> str:
-    """执行完整的脑暴流程，返回 session 文件路径。
+    webhook: Optional[str] = None,
+) -> BrainstormResult:
+    """执行完整的脑暴流程，返回 BrainstormResult（str 兼容，可取 .round_summaries 等）。
 
     webhook: 本场脑暴推送的飞书 webhook URL。由调用方传入以区分：
       - 脑暴机器人发起：传 FEISHU_WEBHOOK（或 BRAINSTORM_FEISHU_WEBHOOK）
@@ -628,6 +730,8 @@ def run_brainstorm(
 
     ts = run_timestamp()
     round_summaries: list[str] = []
+    topic_refined = ""
+    final_output = ""
     session_lines = [
         f"# Session {ts}",
         f"Topic (raw): {topic}",
@@ -641,6 +745,7 @@ def run_brainstorm(
         refined = refine_brainstorm_topic_deepseek(topic, context, topic_type=topic_type)
         if refined:
             topic = refined
+            topic_refined = refined
             session_lines.append("DeepSeek 优化后的主题与思路：")
             session_lines.append("")
             session_lines.append(refined)
@@ -779,7 +884,12 @@ def run_brainstorm(
     else:
         _send_brainstorm_card("脑暴结束", f"完整会话与 Handoff Pack 已保存至 `{path}`", color="green", webhook_override=resolved_webhook)
     print("\n========== 脑暴结束 ==========", flush=True)
-    return str(path)
+    return BrainstormResult(
+        str(path),
+        round_summaries=round_summaries,
+        final_output=final_output,
+        topic_refined=topic_refined,
+    )
 
 
 # ── CLI 入口 ─────────────────────────────────────────────────

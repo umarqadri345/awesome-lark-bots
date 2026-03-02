@@ -10,9 +10,11 @@
 import json
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
+
+BEIJING = timezone(timedelta(hours=8))
 
 from core.llm import chat
 
@@ -172,7 +174,7 @@ def _format_project_overview() -> str:
             if g.get("deadline"):
                 try:
                     dl = datetime.strptime(g["deadline"], "%Y-%m-%d")
-                    days_left = (dl - datetime.utcnow()).days
+                    days_left = (dl - datetime.now(tz=BEIJING).replace(tzinfo=None)).days
                     if days_left <= 7:
                         deadline_warn = f" ⏰ {days_left}天后到期"
                     elif days_left <= 0:
@@ -321,7 +323,7 @@ def generate_weekly_report(user_open_id: Optional[str] = None) -> str:
 def generate_monthly_report(month: str = "", user_open_id: Optional[str] = None) -> str:
     """生成月报：线程 + 项目 + 财务 + 目标全维度复盘。"""
     if not month:
-        now = datetime.utcnow()
+        now = datetime.now(tz=BEIJING)
         first = now.replace(day=1)
         last_month = first - timedelta(days=1)
         month = last_month.strftime("%Y-%m")

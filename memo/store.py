@@ -102,7 +102,8 @@ def list_memos(
     include_done: bool = False,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    items = _load_all()
+    with _lock:
+        items = _load_all_unlocked()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
     if not include_done:
@@ -128,7 +129,8 @@ def list_memos(
 
 def list_threads(user_open_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """列出所有线程及其统计。返回 [{thread, count, latest_at, latest_content}]。"""
-    items = _load_all()
+    with _lock:
+        items = _load_all_unlocked()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
 
@@ -154,7 +156,8 @@ def thread_summary(
     days: int = 7,
 ) -> Dict[str, Any]:
     """生成线程活跃度摘要（用于日报/周报）。"""
-    items = _load_all()
+    with _lock:
+        items = _load_all_unlocked()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
 
@@ -197,7 +200,8 @@ def thread_summary(
 def get_due_reminders(user_open_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """获取今日到期的提醒备忘。"""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    items = _load_all()
+    with _lock:
+        items = _load_all_unlocked()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
     return [
@@ -293,36 +297,90 @@ def delete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = Non
     return True, f"已清除第 {index_one_based} 条备忘：{content_preview}{'…' if len(to_remove.get('content') or '') > 20 else ''}"
 
 
+def delete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -> tuple[bool, str]:
+    """按关键词模糊匹配删除备忘。多条匹配时列出让用户选序号。"""
+    with _lock:
+        all_items = _load_all_unlocked()
+        items = list(all_items)
+        if user_open_id:
+            items = [m for m in items if m.get("user_open_id") == user_open_id]
+        kw = keyword.strip().lower()
+        matched = [m for m in items if kw in (m.get("content") or "").lower()]
+        if not matched:
+            return False, f"没找到包含「{keyword}」的备忘。"
+        if len(matched) > 1:
+            lines = [f"找到 {len(matched)} 条匹配，请用「删除 序号」指定："]
+            for i, m in enumerate(matched[:5], 1):
+                thread = m.get("thread") or ""
+                tag = f" [#{thread}]" if thread else ""
+                lines.append(f"  {i}. {tag} {(m.get('content') or '')[:40]}")
+            return False, "\n".join(lines)
+        target = matched[0]
+        memo_id = target.get("id")
+        content_preview = (target.get("content") or "")[:30]
+        thread = target.get("thread") or ""
+        all_items = [m for m in all_items if m.get("id") != memo_id]
+        _save_all_unlocked(all_items)
+    tag = f" #{thread}" if thread else ""
+    return True, f"🗑️ 已删除备忘{tag}：{content_preview}"
+
+
 def export_board_data(
     user_open_id: Optional[str] = None,
     thread: Optional[str] = None,
-) -> tuple[list[str], list[list[str]]]:
-    """把线程备忘导出为表格数据，用于生成飞书电子表格。
+) -> tuple[list[str], list[list[str]], dict]:
+    """把线程备忘导出为分区看板数据。
 
     Args:
         thread: 指定线程名（不含 #），None 则导出所有线程。
 
-    Returns: (headers, rows)  每行对应一条备忘。
+    Returns: (headers, rows, stats)
+        stats: {"today": n, "week": n, "stale": n, "done": n}
     """
-    items = _load_all()
+    with _lock:
+        items = _load_all_unlocked()
     if user_open_id:
         items = [m for m in items if m.get("user_open_id") == user_open_id]
     if thread:
         t = thread.strip().lstrip("#").lower()
         items = [m for m in items if (m.get("thread") or "").lower() == t]
 
-    items.sort(key=lambda m: (m.get("thread") or "(未分类)", m.get("created_at", "")))
+    now = datetime.utcnow()
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    headers = ["线程", "内容", "状态", "创建时间"]
+    _PARTITION_ORDER = {"今日新增": 0, "本周进行中": 1, "等待跟进": 2, "已完成": 3}
+    stats = {"today": 0, "week": 0, "stale": 0, "done": 0}
+
+    headers = ["线程", "内容", "状态", "创建时间", "分区"]
     rows: List[list[str]] = []
     for m in items:
         thr = m.get("thread") or "(未分类)"
         content = (m.get("content") or "")[:120]
-        status = "✅ 已完成" if m.get("done") else "⬜ 进行中"
         created = (m.get("created_at") or "")[:10]
-        rows.append([thr, content, status, created])
+        created_full = m.get("created_at") or ""
 
-    return headers, rows
+        if m.get("done"):
+            status = "✅ 已完成"
+            partition = "已完成"
+            stats["done"] += 1
+        elif created.startswith(today_str):
+            status = "🆕 进行中"
+            partition = "今日新增"
+            stats["today"] += 1
+        elif created_full >= week_ago:
+            status = "⬜ 进行中"
+            partition = "本周进行中"
+            stats["week"] += 1
+        else:
+            status = "⏳ 待跟进"
+            partition = "等待跟进"
+            stats["stale"] += 1
+
+        rows.append([thr, content, status, created, partition])
+
+    rows.sort(key=lambda r: (_PARTITION_ORDER.get(r[4], 9), r[3]))
+    return headers, rows, stats
 
 
 def set_memo_category_by_index(

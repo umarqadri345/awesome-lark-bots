@@ -82,6 +82,7 @@ def load_context(value: str) -> str:
         return ""
     raw = value.strip()
     cwd = Path.cwd()
+    base_dir = cwd.resolve()
     chunks = []
     for token in (_p.strip() for _s in raw.split(",") for _p in _s.split()):
         if not token:
@@ -89,6 +90,9 @@ def load_context(value: str) -> str:
         path = Path(token)
         if not path.is_absolute():
             path = cwd / path
+        resolved = path.resolve()
+        if not str(resolved).startswith(str(base_dir)):
+            continue
         if path.exists():
             if path.is_file():
                 chunks.append(f"--- {path.name} ---\n{_read_file_safe(path)}")

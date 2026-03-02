@@ -67,6 +67,8 @@ class MarketingSkill(Skill):
 
     def load_module(self, filename: str, header_chars: int = 500) -> str:
         """加载单个模块的摘要（前 N 个字符）。"""
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return ""
         path = self.modules_dir / filename
         if not path.exists():
             return ""
@@ -75,6 +77,8 @@ class MarketingSkill(Skill):
 
     def load_module_full(self, filename: str) -> str:
         """加载单个模块的完整内容。"""
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return ""
         path = self.modules_dir / filename
         if not path.exists():
             return ""

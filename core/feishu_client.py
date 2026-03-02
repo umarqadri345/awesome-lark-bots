@@ -60,7 +60,10 @@ def get_tenant_access_token() -> str:
             raise ValueError("请设置环境变量 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
         url = f"{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal"
         resp = requests.post(url, json={"app_id": app_id, "app_secret": app_secret}, timeout=10)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            raise RuntimeError(f"获取 tenant_access_token 失败: 非 JSON 响应 status={resp.status_code}")
         if data.get("code") != 0:
             raise RuntimeError(f"获取 tenant_access_token 失败: {data}")
         _token_cache = data["tenant_access_token"]
@@ -154,7 +157,11 @@ def reply_message(message_id: str, text: str) -> dict:
     payload = {"msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}
     try:
         resp = requests.post(url, json=payload, headers=_headers(), timeout=10)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            _warn(f"回复消息: 非 JSON 响应 status={resp.status_code}")
+            return {"code": -1, "msg": "API 返回非 JSON 响应"}
         if data.get("code") != 0:
             _warn(f"回复消息失败 code={data.get('code')} msg={data.get('msg')}")
         return data
@@ -172,7 +179,11 @@ def send_message_to_user(open_id: str, text: str) -> dict:
     }
     try:
         resp = requests.post(url, json=payload, headers=_headers(), timeout=10)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            _warn(f"主动发消息: 非 JSON 响应 status={resp.status_code}")
+            return {"code": -1, "msg": "API 返回非 JSON 响应"}
         if data.get("code") != 0:
             _warn(f"主动发消息失败 code={data.get('code')} msg={data.get('msg')}")
         return data
@@ -414,7 +425,11 @@ def create_document_with_content(
     token = doc_create_token or get_user_access_token("doc_create")
     url = f"{FEISHU_API_BASE}/docx/v1/documents"
     resp = requests.post(url, json={"title": title}, headers=_headers(token), timeout=10)
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        _warn(f"创建文档: 非 JSON 响应 status={resp.status_code}")
+        return False, "API 返回非 JSON 响应"
     if data.get("code") != 0:
         return False, data.get("msg", "创建文档失败") or str(data)
     doc = (data.get("data") or {}).get("document") or {}
@@ -558,16 +573,27 @@ _THEME_PRESETS = {
 }
 
 
+_PARTITION_COLORS = {
+    "今日新增": "#E8F5E9",
+    "本周进行中": "#E3F2FD",
+    "等待跟进": "#FFF3E0",
+    "已完成": "#F5F5F5",
+}
+
+
 def _style_spreadsheet(
     ss_token: str, sheet_id: str,
     headers: list[str], rows: list[list[str]],
     end_col: str, token: str,
     theme: str = "blue",
+    partition_col: int = -1,
 ) -> None:
     """美化飞书电子表格。
 
-    样式包括：主题配色表头、交替行色、全边框、列宽自适应、
+    样式包括：主题配色表头、交替行色/分区行色、全边框、列宽自适应、
     统一行高、冻结首行、垂直居中。所有操作 best-effort。
+
+    partition_col: 如果 >= 0，使用该列值决定行背景色（覆盖条纹色）。
     """
     hdrs = _headers(token)
     palette = _THEME_PRESETS.get(theme, _THEME_PRESETS["blue"])
@@ -593,7 +619,7 @@ def _style_spreadsheet(
         },
     })
 
-    # 2) 数据区域：交替行色 + 边框 + 垂直居中
+    # 2) 数据区域：边框 + 垂直居中
     if num_rows > 0:
         batch_styles.append({
             "ranges": f"{sheet_id}!A2:{end_col}{total_rows}",
@@ -605,17 +631,28 @@ def _style_spreadsheet(
             },
         })
 
-        # 偶数行（第 2, 4, 6… 数据行 → 表格行 3, 5, 7…）加条纹背景
-        stripe_ranges = []
-        for i in range(1, num_rows, 2):
-            row_num = i + 2
-            stripe_ranges.append(f"{sheet_id}!A{row_num}:{end_col}{row_num}")
-        if stripe_ranges:
-            for sr in stripe_ranges[:50]:
-                batch_styles.append({
-                    "ranges": sr,
-                    "style": {"backColor": palette["stripe_bg"]},
-                })
+        use_partition = partition_col >= 0
+        if use_partition:
+            for i, row in enumerate(rows):
+                row_num = i + 2
+                part_val = row[partition_col] if partition_col < len(row) else ""
+                bg = _PARTITION_COLORS.get(part_val)
+                if bg:
+                    batch_styles.append({
+                        "ranges": f"{sheet_id}!A{row_num}:{end_col}{row_num}",
+                        "style": {"backColor": bg},
+                    })
+        else:
+            stripe_ranges = []
+            for i in range(1, num_rows, 2):
+                row_num = i + 2
+                stripe_ranges.append(f"{sheet_id}!A{row_num}:{end_col}{row_num}")
+            if stripe_ranges:
+                for sr in stripe_ranges[:50]:
+                    batch_styles.append({
+                        "ranges": sr,
+                        "style": {"backColor": palette["stripe_bg"]},
+                    })
 
     # 发送批量样式请求（单次最多 50 条范围，分批）
     for start in range(0, len(batch_styles), 50):
@@ -699,6 +736,7 @@ def create_spreadsheet_with_data(
     extra_text: str = "",
     owner_open_id: Optional[str] = None,
     theme: str = "blue",
+    partition_col: int = -1,
 ) -> Tuple[bool, str]:
     """创建飞书电子表格并写入结构化数据。
 
@@ -709,7 +747,11 @@ def create_spreadsheet_with_data(
 
     url = f"{FEISHU_API_BASE}/sheets/v3/spreadsheets"
     resp = requests.post(url, json={"title": title}, headers=_headers(token), timeout=15)
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        _warn(f"创建表格: 非 JSON 响应 status={resp.status_code}")
+        return False, "API 返回非 JSON 响应"
     if data.get("code") != 0:
         return False, data.get("msg", "创建表格失败") or str(data)
 
@@ -764,7 +806,7 @@ def create_spreadsheet_with_data(
     if d3.get("code") != 0:
         _warn(f"写入表格数据失败: code={d3.get('code')} msg={d3.get('msg')}")
 
-    _style_spreadsheet(ss_token, sheet_id, headers, rows, end_col, token, theme=theme)
+    _style_spreadsheet(ss_token, sheet_id, headers, rows, end_col, token, theme=theme, partition_col=partition_col)
 
     if owner_open_id:
         perm_url = f"{FEISHU_API_BASE}/drive/v1/permissions/{ss_token}/members"
@@ -792,6 +834,7 @@ def create_spreadsheet_detail(
     rows: list[list[str]],
     owner_open_id: Optional[str] = None,
     theme: str = "indigo",
+    partition_col: int = -1,
 ) -> Tuple[bool, dict]:
     """创建电子表格并返回详细信息（供项目注册用）。
 
@@ -800,6 +843,7 @@ def create_spreadsheet_detail(
     ok, url_or_err = create_spreadsheet_with_data(
         title=title, headers=headers, rows=rows,
         owner_open_id=owner_open_id, theme=theme,
+        partition_col=partition_col,
     )
     if not ok:
         return False, {"error": url_or_err}
@@ -1026,3 +1070,124 @@ def complete_task(task_id: str) -> Tuple[bool, str]:
         return True, "任务已标记完成"
     except Exception as e:
         return False, f"完成任务异常: {e}"
+
+
+# ── 文档读取 ─────────────────────────────────────────────────
+
+def read_document_content(document_id: str) -> Tuple[bool, str]:
+    """读取飞书云文档内容为纯文本（Markdown 风格）。"""
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/docx/v1/documents/{document_id}/blocks"
+        all_blocks: list = []
+        page_token: Optional[str] = None
+        for _ in range(20):
+            params: dict = {"document_revision_id": -1, "page_size": 50}
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(url, params=params, headers=_headers(token), timeout=15)
+            data = resp.json()
+            if data.get("code") != 0:
+                return False, data.get("msg", "读取文档失败") or str(data)
+            items = (data.get("data") or {}).get("items") or []
+            all_blocks.extend(items)
+            page_token = (data.get("data") or {}).get("page_token")
+            if not page_token:
+                break
+
+        _prefix_map = {3: "# ", 4: "## ", 5: "### ", 12: "- ", 13: "1. "}
+        lines: list[str] = []
+        for block in all_blocks:
+            bt = block.get("block_type", 0)
+            text_content = ""
+            for key in ("text", "heading1", "heading2", "heading3", "heading4",
+                        "bullet", "ordered", "code", "quote"):
+                bd = block.get(key)
+                if bd and "elements" in bd:
+                    parts = []
+                    for elem in bd["elements"]:
+                        tr = elem.get("text_run")
+                        if tr:
+                            parts.append(tr.get("content", ""))
+                    text_content = "".join(parts)
+                    break
+            if text_content:
+                lines.append(_prefix_map.get(bt, "") + text_content)
+        return True, "\n".join(lines)
+    except Exception as e:
+        return False, f"读取文档异常: {e}"
+
+
+def add_sheet_tab(
+    spreadsheet_token: str,
+    title: str,
+    index: int = 0,
+) -> Tuple[bool, str]:
+    """给已有电子表格添加新的工作表 tab。返回 (ok, sheet_id_or_error)。"""
+    try:
+        url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/sheets_batch_update"
+        resp = requests.post(url, json={
+            "requests": [{"addSheet": {"properties": {"title": title, "index": index}}}]
+        }, headers=_headers(), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "添加工作表失败") or str(data)
+        replies = (data.get("data") or {}).get("replies") or []
+        if replies:
+            props = (replies[0].get("addSheet") or {}).get("properties") or {}
+            sid = props.get("sheetId", "")
+            if sid:
+                return True, sid
+        return False, "添加工作表成功但未返回 sheetId"
+    except Exception as e:
+        return False, f"添加工作表异常: {e}"
+
+
+def write_sheet_header(
+    spreadsheet_token: str,
+    sheet_id: str,
+    headers: list[str],
+    theme: str = "blue",
+) -> Tuple[bool, str]:
+    """给工作表写入表头行并设置样式。"""
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        num_cols = len(headers)
+        end_col = chr(64 + min(num_cols, 26))
+        range_str = f"{sheet_id}!A1:{end_col}1"
+        url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values"
+        resp = requests.put(
+            url,
+            json={"valueRange": {"range": range_str, "values": [headers]}},
+            headers=_headers(token),
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "写入表头失败") or str(data)
+        _style_spreadsheet(
+            ss_token=spreadsheet_token, sheet_id=sheet_id,
+            headers=headers, rows=[], end_col=end_col,
+            token=token, theme=theme,
+        )
+        return True, "表头已写入"
+    except Exception as e:
+        return False, f"写入表头异常: {e}"
+
+
+def read_spreadsheet_values(
+    spreadsheet_token: str,
+    range_str: str,
+) -> Tuple[bool, list]:
+    """读取电子表格指定范围的值。range_str 如 'sheetId!A1:L100'。"""
+    try:
+        from urllib.parse import quote
+        url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{quote(range_str, safe='')}"
+        resp = requests.get(url, headers=_headers(), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, []
+        values = ((data.get("data") or {}).get("valueRange") or {}).get("values") or []
+        return True, values
+    except Exception:
+        return False, []

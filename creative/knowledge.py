@@ -290,3 +290,106 @@ def build_generate_from_chat_prompt(chat_summary: str) -> str:
         "请根据讨论中确定的方向，判断使用单镜头模式还是分镜模式，"
         "生成完整的结构化 prompt。"
     )
+
+
+# ──────────────────────────────────────────────
+# 执行落地模式提示词
+# ──────────────────────────────────────────────
+
+EXEC_DISCUSS_SYSTEM_PROMPT = """你是「AI 素材 Prompt 助手」的执行落地模式。
+用户已有一个AI生成的创意概念，现在想把它落地为实际素材交付。
+你需要通过简短对话（2-3轮）收集执行所需的关键信息。
+
+你需要了解的信息：
+1. 素材类型和规格（视频/图片/动图？尺寸？时长？）
+2. 投放渠道（抖音/小红书/官网/线下？）
+3. 制作方式（纯AI生成/游戏内录/实拍/混合？）
+4. 风格偏好（在AI概念基础上有什么调整？）
+5. 预算范围
+6. 截止日期
+7. 执行方（内部团队/外部供应商？对接人？）
+
+对话策略：
+- 先浏览AI Prompt，提炼已知信息，不重复问
+- 每轮只问1-2个关键问题
+- 用选择题形式让回答更轻松
+- 简洁高效，不啰嗦
+- 收集到足够信息后，主动说："信息差不多了，发「可以了」我来生成执行Brief文档 📝"
+
+重要：你只收集信息和讨论，不输出Brief。Brief文档会在用户确认后自动生成。
+"""
+
+
+def build_exec_discuss_system_prompt(
+    brand: Optional[dict] = None,
+    ai_prompt: str = "",
+    user_text: str = "",
+) -> str:
+    """执行讨论模式的 system prompt。"""
+    prompt = EXEC_DISCUSS_SYSTEM_PROMPT
+    if ai_prompt:
+        prompt += f"\n\n━━ 用户的AI创意概念（参考） ━━\n{ai_prompt[:800]}\n━━━━━━━━━━\n"
+    if brand:
+        prompt += "\n" + brand_to_prompt_section(brand)
+    try:
+        from core.skill_router import enrich_prompt
+        prompt = enrich_prompt(prompt, user_text=user_text, bot_type="creative")
+    except Exception:
+        pass
+    return prompt
+
+
+def build_exec_brief_prompt(discussion_summary: str, ai_prompt: str) -> str:
+    """根据执行讨论内容和AI概念，生成执行Brief的 user prompt。"""
+    return f"""请根据以下AI创意概念和执行讨论，生成一份简洁的「素材执行Brief」。
+
+## AI创意概念
+{ai_prompt[:1000]}
+
+## 执行讨论记录
+{discussion_summary}
+
+## 输出要求
+用 Markdown 格式输出：
+
+# 素材执行 Brief
+
+## 项目信息
+- 品牌：
+- 项目名称：
+
+## 创意概念
+[用2-3句人话描述，不用AI prompt技术语言]
+
+## 素材规格
+- 素材类型：
+- 尺寸/画幅：
+- 时长：（如适用）
+- 投放渠道：
+
+## 制作要求
+[具体画面、风格、制作方式要求]
+
+## 参考方向
+[从AI prompt中提炼的风格参考]
+
+## 交付信息
+- 预算：
+- 截止日期：
+- 执行方：
+- 对接人：
+
+注意：信息不全的字段写「待确认」。简洁专业，让不了解AI工具的人也能看懂。"""
+
+
+def build_extract_brief_info_prompt(brief_content: str) -> str:
+    """从Brief文档内容中提取结构化信息的 prompt。"""
+    return f"""从以下素材执行Brief中提取结构化信息，仅返回JSON。
+
+Brief内容：
+{brief_content[:2000]}
+
+返回如下JSON（只返回JSON，不要其他文字）：
+{{"brand":"品牌名","concept":"创意概念一句话","asset_type":"素材类型","channel":"渠道","executor":"执行方","budget":"预算","deadline":"截止日期","contact":"对接人"}}
+
+未提及的字段填"待确认"。"""

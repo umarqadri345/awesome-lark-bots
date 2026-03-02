@@ -40,7 +40,14 @@ from core.cards import welcome_card, progress_card, result_card, error_card, hel
 from core.llm import chat_completion
 from core.utils import truncate_for_display
 from planner.run import run_planning, generate_doc, detect_mode
-from planner.prompts import PLANNER_SYSTEM, DOC_TYPES, DOC_MENU, DOC_CATEGORY_TYPES, detect_doc_category, build_doc_menu
+from planner.prompts import (
+    PLANNER_SYSTEM, DOC_TYPES, DOC_MENU, DOC_CATEGORY_TYPES,
+    detect_doc_category, build_doc_menu, FOLLOWUP_SYSTEM,
+)
+from memo.projects import register_project
+
+_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "")
+_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "")
 
 # ── 日志 ─────────────────────────────────────────────────────
 
@@ -223,34 +230,84 @@ _pending_docs: dict[str, dict] = {}
 _pending_docs_lock = threading.Lock()
 _DOC_SESSION_TTL = 1800  # 30 min
 
+# ── 规划上下文（支持追问）────────────────────────────────
+_planning_contexts: dict[str, dict] = {}
+_planning_contexts_lock = threading.Lock()
+_PLANNING_CONTEXT_TTL = 3600  # 1h
+
+_EXIT_FOLLOWUP_COMMANDS = {"结束讨论", "新话题", "结束", "退出讨论", "exit", "done"}
+
+# ── 项目纳入（待确认）───────────────────────────────────
+_pending_project_regs: dict[str, dict] = {}
+_pending_project_regs_lock = threading.Lock()
+_PROJECT_REG_TTL = 1800  # 30 min
+
 _DOC_DESCRIPTIONS = {
-    "brief": "执行 Brief — 可直接发给团队的方案摘要",
-    "calendar": "内容日历 — 按周排列的内容排期表",
-    "timeline": "里程碑时间线 — 关键节点 + 依赖 + 风险",
-    "decision": "决策备忘 — 一页纸决策记录",
+    # 给自己
+    "checklist": "行动 Checklist — 按紧急度分层的待办清单",
+    # 给决策者
+    "proposal": "方案提案 — 为什么值得做 + 方案 + 预期回报",
+    "decision": "决策一页纸 — 选了什么、为什么不选别的",
+    # 给团队
+    "brief": "执行 Brief — 给团队的落地方案 + 排期 + 风险",
+    "timeline": "排期表 — 里程碑 + 时间 + 卡点",
+    # 存档
+    "summary": "规划摘要 — 核心结论 + 关键假设 + 下一步",
+    # 旅行
     "itinerary": "行程表 — 按天排列的完整行程",
     "budget": "预算清单 — 分项预算 + 省钱建议",
-    "packing": "打包清单 — 根据目的地定制的行李清单",
-    "action": "行动清单 — 按步骤排列的执行 TODO",
+    # 项目
     "spec": "项目 Spec — 范围定义 + MVP + 技术选型",
     "features": "功能优先级 — P0/P1/P2 功能拆分表",
+    # 营销
+    "calendar": "内容日历 — 按周排列的内容排期表",
+}
+
+
+_AUDIENCE_GROUPS = [
+    ("📋 给自己", ["checklist"]),
+    ("📊 给决策者 / 汇报", ["proposal", "decision"]),
+    ("👥 给团队执行", ["brief", "timeline"]),
+    ("📁 存档 / 复盘", ["summary"]),
+]
+
+_TOPIC_LABELS = {
+    "travel": "✈️ 旅行专属",
+    "project": "🛠 项目专属",
+    "marketing": "📣 营销专属",
 }
 
 
 def _doc_menu_card(category: str = "general") -> dict:
-    """根据话题类别生成文档选择菜单卡片。"""
-    types = DOC_CATEGORY_TYPES.get(category, DOC_CATEGORY_TYPES["general"])
-    lines = ["规划完成！可以帮你生成以下文档：\n"]
-    for i, dt in enumerate(types, 1):
-        desc = _DOC_DESCRIPTIONS.get(dt, DOC_TYPES[dt]["name"])
-        lines.append(f"**{i}. {desc}**")
+    """根据话题类别生成受众分组的文档选择菜单卡片。"""
+    from planner.prompts import DOC_TOPIC_EXTRAS
+    extras = DOC_TOPIC_EXTRAS.get(category, [])
+
+    lines = ["规划完成！根据你的需要选择文档：\n"]
+    idx = 1
+    for group_name, group_types in _AUDIENCE_GROUPS:
+        lines.append(f"**{group_name}**")
+        for dt in group_types:
+            desc = _DOC_DESCRIPTIONS.get(dt, DOC_TYPES[dt]["name"])
+            lines.append(f"  {idx}. {desc}")
+            idx += 1
+
+    if extras:
+        label = _TOPIC_LABELS.get(category, "📎 专属")
+        lines.append(f"\n**{label}**")
+        for dt in extras:
+            desc = _DOC_DESCRIPTIONS.get(dt, DOC_TYPES[dt]["name"])
+            lines.append(f"  {idx}. {desc}")
+            idx += 1
+
     lines.append("")
-    lines.append("回复数字（如 `1`）或名称即可生成。")
-    lines.append("回复 `全部` 生成所有文档。")
+    lines.append("回复数字（如 `1`）或名称即可生成。回复 `全部` 生成所有。")
+    lines.append("也可以直接提问，追问规划中的任何内容。")
+    lines.append("发「结束讨论」退出追问模式。")
     return make_card("需要生成文档吗？", [
         {"text": "\n".join(lines)},
         {"divider": True},
-        {"note": "30 分钟内有效  ·  也可以继续聊别的"},
+        {"note": "1 小时内可追问  ·  30 分钟内可生成文档"},
     ], color="purple")
 
 
@@ -449,6 +506,164 @@ def _handle_doc_choice(mid: str, uid: Optional[str], user_key: str, doc_types: l
     if remaining:
         _send_msg(uid, mid, f"还可以生成：{'、'.join(remaining)}（回复对应数字或名称）")
 
+    # ── 项目纳入提示 ──
+    if all_links:
+        first_name, first_url, _ = all_links[0]
+        with _pending_project_regs_lock:
+            _pending_project_regs[user_key] = {
+                "default_name": short_title,
+                "url": first_url,
+                "doc_name": first_name,
+                "all_links": [(n, u, t) for n, u, t in all_links],
+                "spreadsheet_token": "",
+                "sheet_id": "",
+                "tags": [topic[:20]],
+                "ts": time.time(),
+            }
+        _send_msg(
+            uid, mid,
+            "回复「纳入项目 #标签」可将此文档记录到项目管理表\n"
+            "示例：纳入项目 #Q3增长  |  纳入项目 自定义名称 #标签1 #标签2\n"
+            "直接回复「纳入项目」则使用默认名称和标签",
+        )
+
+
+# ── 规划追问 ─────────────────────────────────────────────
+
+def _has_planning_context(user_key: str) -> Optional[dict]:
+    """检查用户是否有未过期的规划上下文。"""
+    with _planning_contexts_lock:
+        ctx = _planning_contexts.get(user_key)
+    if not ctx:
+        return None
+    if time.time() - ctx["ts"] > _PLANNING_CONTEXT_TTL:
+        with _planning_contexts_lock:
+            _planning_contexts.pop(user_key, None)
+        return None
+    return ctx
+
+
+def _clear_planning_context(user_key: str) -> None:
+    with _planning_contexts_lock:
+        _planning_contexts.pop(user_key, None)
+
+
+def _is_explicit_new_planning(text: str) -> bool:
+    """判断是否是显式的新规划请求（带前缀）。"""
+    t = text.strip()
+    for prefix in _PLANNING_PREFIXES:
+        if t.lower().startswith(prefix) or t.startswith(prefix):
+            return True
+    return False
+
+
+def _planning_followup(text: str, user_key: str) -> str:
+    """基于规划上下文的追问回复（支持多轮对话历史）。"""
+    with _planning_contexts_lock:
+        ctx = _planning_contexts.get(user_key)
+    if not ctx:
+        return "规划上下文已过期，请重新发起规划。"
+
+    planning_summary = "\n\n".join(
+        f"第 {num} 步 {name}：\n{out}"
+        for num, name, out in ctx["outputs"]
+    )
+    system = FOLLOWUP_SYSTEM + f"\n\n--- 你之前完成的规划 ---\n主题：{ctx['topic']}\n\n{planning_summary}"
+
+    try:
+        from core.skill_router import enrich_prompt
+        system = enrich_prompt(system, user_text=text, bot_type="planner")
+    except Exception:
+        pass
+
+    messages = [{"role": "system", "content": system}]
+    for h in ctx.get("history", [])[-6:]:
+        messages.append(h)
+    messages.append({"role": "user", "content": text})
+
+    reply = chat_completion(provider="deepseek", messages=messages).strip()
+
+    with _planning_contexts_lock:
+        ctx = _planning_contexts.get(user_key)
+        if ctx:
+            ctx.setdefault("history", []).append({"role": "user", "content": text})
+            ctx["history"].append({"role": "assistant", "content": reply})
+            if len(ctx["history"]) > 12:
+                ctx["history"] = ctx["history"][-8:]
+            ctx["ts"] = time.time()
+
+    return reply
+
+
+# ── 项目纳入 ─────────────────────────────────────────────
+
+_PROJECT_REG_SIGNALS = ("纳入项目", "纳入管理", "记录项目", "add project", "register project")
+
+
+def _resolve_project_registration(text: str, user_key: str) -> Optional[dict]:
+    """检查用户消息是否是项目纳入请求，解析项目名和 #标签。
+
+    支持格式：
+      "纳入项目"                    → 默认名称 + 默认标签
+      "纳入项目 #Q3增长"            → 默认名称 + ["Q3增长"]
+      "纳入项目 我的项目 #Q3 #营销"  → 名称"我的项目" + ["Q3", "营销"]
+    """
+    import re
+
+    with _pending_project_regs_lock:
+        pending = _pending_project_regs.get(user_key)
+    if not pending:
+        return None
+    if time.time() - pending["ts"] > _PROJECT_REG_TTL:
+        with _pending_project_regs_lock:
+            _pending_project_regs.pop(user_key, None)
+        return None
+
+    t = text.strip().lower()
+    for sig in _PROJECT_REG_SIGNALS:
+        if sig in t:
+            remainder = text.strip()
+            for sig2 in _PROJECT_REG_SIGNALS:
+                remainder = remainder.replace(sig2, "").strip()
+
+            tags = re.findall(r"#(\S+)", remainder)
+            name = re.sub(r"#\S+", "", remainder).strip()
+
+            if not name:
+                name = pending.get("default_name", "")
+            merged_tags = list(dict.fromkeys(
+                (tags if tags else []) + pending.get("tags", [])
+            ))
+            return {**pending, "project_name": name, "tags": merged_tags}
+    return None
+
+
+def _handle_project_registration(mid: str, uid: Optional[str], user_key: str, reg_info: dict) -> None:
+    """将文档纳入项目管理。"""
+    project_name = reg_info.get("project_name") or reg_info.get("default_name", "未命名项目")
+    url = reg_info.get("url", "")
+    doc_name = reg_info.get("doc_name", "")
+
+    try:
+        project_id = register_project(
+            name=project_name,
+            spreadsheet_token=reg_info.get("spreadsheet_token", ""),
+            sheet_id=reg_info.get("sheet_id", ""),
+            url=url,
+            created_by=uid or "",
+            tags=reg_info.get("tags", []),
+            source="planner",
+            doc_type=doc_name,
+        )
+        _send_msg(uid, mid, f"已纳入项目管理 ✓\n项目：{project_name}\n文档：{doc_name}\nID：{project_id[:8]}")
+        _log(f"项目注册: {project_name} → {project_id}")
+    except Exception as e:
+        _log(f"项目注册失败: {e}")
+        _send_msg(uid, mid, "项目注册失败，请稍后重试。")
+    finally:
+        with _pending_project_regs_lock:
+            _pending_project_regs.pop(user_key, None)
+
 
 # ── 消息处理 ─────────────────────────────────────────────────
 
@@ -489,6 +704,34 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 _handle_doc_choice(mid, uid, user_key, doc_choice)
                 return
 
+            # ── 退出追问 ──
+            if text.strip() in _EXIT_FOLLOWUP_COMMANDS and _has_planning_context(user_key):
+                _clear_planning_context(user_key)
+                with _pending_docs_lock:
+                    _pending_docs.pop(user_key, None)
+                with _pending_project_regs_lock:
+                    _pending_project_regs.pop(user_key, None)
+                reply_message(mid, "已结束讨论。发新消息即可开始新的对话或规划。")
+                return
+
+            # ── 项目纳入请求 ──
+            project_reg = _resolve_project_registration(text, user_key)
+            if project_reg:
+                _handle_project_registration(mid, uid, user_key, project_reg)
+                return
+
+            # ── 规划追问（有上下文 + 非显式新规划）──
+            if _has_planning_context(user_key) and not _is_explicit_new_planning(text):
+                _log(f"追问模式: {text[:60]!r}")
+                try:
+                    answer = _planning_followup(text, user_key)
+                    reply_message(mid, answer)
+                except Exception as e:
+                    _log(f"追问回复异常: {e}")
+                    reply_message(mid, "抱歉，追问时出了点问题。你可以继续提问或发「结束讨论」退出。")
+                return
+
+            # ── 普通对话（无规划信号）──
             if not _needs_planning(text):
                 _log(f"对话模式: {text[:60]!r}")
                 try:
@@ -499,7 +742,9 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     reply_message(mid, "抱歉，出了点问题，稍后再试。")
                 return
 
+            # ── 新规划：清除旧上下文 ──
             topic, context, mode = _parse_planning_input(text)
+            _clear_planning_context(user_key)
             if not topic:
                 reply_card(mid, _welcome())
                 return
@@ -521,8 +766,8 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 path, planning_outputs = run_planning(topic=topic, context=context, mode=mode)
                 done_card = result_card(
                     "规划完成",
-                    fields=[("主题", topic[:100]), ("模式", mode), ("会话文件", f"`{path}`")],
-                    next_actions=["回复数字生成文档", "发新主题继续规划"],
+                    fields=[("主题", topic[:100]), ("模式", mode)],
+                    next_actions=["回复数字生成文档", "直接追问规划内容", "发「结束讨论」退出追问模式"],
                 )
                 if uid:
                     send_card_to_user(uid, done_card)
@@ -545,6 +790,18 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         "doc_menu": build_doc_menu(category),
                         "ts": time.time(),
                     }
+
+                # 存储规划上下文以便追问
+                with _planning_contexts_lock:
+                    _planning_contexts[user_key] = {
+                        "topic": topic,
+                        "outputs": planning_outputs,
+                        "history": [],
+                        "open_id": uid,
+                        "session_path": path,
+                        "ts": time.time(),
+                    }
+
                 time.sleep(1)
                 menu_card = _doc_menu_card(category)
                 if uid:
@@ -552,6 +809,14 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 else:
                     reply_card(mid, menu_card)
 
+                try:
+                    from core.events import emit as _emit_event
+                    _emit_event("planner", "planning_completed",
+                                f"规划完成: {topic[:50]} ({mode})",
+                                user_id=uid or "",
+                                meta={"topic": topic[:100], "mode": mode, "path": str(path)})
+                except Exception:
+                    pass
                 _log(f"规划完成: {path}")
             except Exception as e:
                 _log(f"规划异常: {e}\n{traceback.format_exc()}")
@@ -599,10 +864,8 @@ RECONNECT_MULTIPLIER = 2
 
 
 def _run_client(app_id: str, app_secret: str) -> None:
-    # SECURITY TODO: 配置飞书事件订阅的 Verification Token 和 Encrypt Key 以启用签名校验
-    # 当前为空字符串，不校验事件来源，生产环境建议配置
     event_handler = (
-        EventDispatcherHandler.builder("", "")
+        EventDispatcherHandler.builder(_VERIFY_TOKEN, _ENCRYPT_KEY)
         .register_p2_im_message_receive_v1(_handle_message)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_handle_bot_p2p_chat_entered)
         .register_p2_im_message_message_read_v1(_handle_message_read)

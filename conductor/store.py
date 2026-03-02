@@ -129,8 +129,10 @@ class ContentStore:
 
     def list_all(self, status: Optional[str] = None) -> list[ContentItem]:
         """列出所有内容，可按状态筛选。"""
+        with self._lock:
+            files = sorted(CONTENT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         items = []
-        for f in sorted(CONTENT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for f in files:
             item = ContentItem.load(f.stem)
             if item and (status is None or item.status == status):
                 items.append(item)
@@ -241,8 +243,10 @@ class ContentStore:
 
     def stats(self) -> dict[str, int]:
         """统计各状态的内容数量。"""
+        with self._lock:
+            files = list(CONTENT_DIR.glob("*.json"))
         counts: dict[str, int] = {}
-        for f in CONTENT_DIR.glob("*.json"):
+        for f in files:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 s = data.get("status", "unknown")
