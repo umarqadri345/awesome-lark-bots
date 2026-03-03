@@ -511,14 +511,43 @@ def _do_generate(user_key: str, user_input: str) -> str:
     system_prompt = build_system_prompt(brand, user_text=user_input)
     user_prompt = build_user_prompt(user_input)
 
-    result = chat_completion(
-        provider="deepseek",
-        system=system_prompt,
-        user=user_prompt,
-        temperature=0.7,
-    )
+    result = _generate_with_research(system_prompt, user_prompt, user_input)
     _update_session(user_key, last_result=result)
     return result
+
+
+def _generate_with_research(system_prompt: str, user_prompt: str, raw_input: str) -> str:
+    """用 AgentLoop 生成 prompt，LLM 可先搜索平台趋势再创作。"""
+    try:
+        from core.agent import AgentLoop
+        from core.tools import (
+            WEB_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL,
+            BRAND_INFO_TOOL, PLATFORM_GUIDE_TOOL,
+        )
+
+        enriched_system = system_prompt + (
+            "\n\n你拥有搜索工具。在生成 prompt 之前，建议：\n"
+            "1. 搜索目标平台（抖音/小红书等）上同类素材的当前流行风格和热门元素（用 search_platform）\n"
+            "2. 如果用户提到了特定话题，搜一下当前热点看是否有可借力的趋势（用 get_trending）\n"
+            "3. 如果需要了解平台投放规范，查平台指南（用 get_platform_guide）\n"
+            "搜索结果融入 prompt 设计中，让创意更贴合真实平台生态。2-3次搜索足够，不要过度。"
+        )
+
+        agent = AgentLoop(
+            provider="deepseek", system=enriched_system, max_rounds=5, temperature=0.7,
+            on_tool_call=lambda name, args: _log(f"🔍 [创意调研] {name}: {str(args)[:80]}"),
+        )
+        agent.add_tools([WEB_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL,
+                         BRAND_INFO_TOOL, PLATFORM_GUIDE_TOOL])
+        result = agent.run(user_prompt)
+        if result.tool_calls_made:
+            _log(f"[生成] 搜索了 {len(result.tool_calls_made)} 次")
+        return result.content
+    except Exception as e:
+        _log(f"[生成] AgentLoop 失败({e}), 回退简单调用")
+        return chat_completion(
+            provider="deepseek", system=system_prompt, user=user_prompt, temperature=0.7,
+        )
 
 
 def _do_refine(user_key: str, feedback: str) -> str:
@@ -575,7 +604,7 @@ def _do_chat(user_key: str, user_input: str) -> str:
 
 
 def _do_generate_from_chat(user_key: str) -> str:
-    """从讨论上下文中生成正式 prompt。"""
+    """从讨论上下文中生成正式 prompt，支持搜索平台趋势。"""
     session = _get_session(user_key)
     history = session.get("chat_history", [])
 
@@ -591,12 +620,7 @@ def _do_generate_from_chat(user_key: str) -> str:
     system_prompt = build_system_prompt(brand, user_text=chat_summary)
     user_prompt = build_generate_from_chat_prompt(chat_summary)
 
-    result = chat_completion(
-        provider="deepseek",
-        system=system_prompt,
-        user=user_prompt,
-        temperature=0.7,
-    )
+    result = _generate_with_research(system_prompt, user_prompt, chat_summary)
     _update_session(user_key, last_result=result, mode="direct", chat_history=[])
     return result
 
@@ -1184,7 +1208,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     _emit_event("creative", "prompt_generated",
                                 f"Prompt 生成完成 ({brand_name})",
                                 user_id=uid or "",
-                                meta={"brand": brand_name, "len": len(result or "")})
+                                meta={"brand": brand_name, "topic": text[:100], "len": len(result or "")})
                 except Exception:
                     pass
                 _log(f"生成完成: user={user_key[:20]} len={len(result or '')}")

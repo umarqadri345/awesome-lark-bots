@@ -102,17 +102,19 @@ def chat_completion(
     messages: Optional[list] = None,
     model_override: Optional[str] = None,
     temperature: float = 0.7,
+    response_format: Optional[dict] = None,
 ) -> str:
     """
     调用 LLM 并返回文本结果。
 
     参数说明：
-      provider      : 模型服务商，"deepseek" / "doubao" / "kimi"
-      system        : 系统提示词（设定 AI 角色和行为规则）
-      user          : 用户消息（你想让 AI 回答的内容）
-      messages      : 多轮对话时直接传完整消息列表，此时 system/user 会被忽略
-      model_override: 强制指定模型名，覆盖环境变量中的默认值
-      temperature   : 创造力（0=确定性高, 1=更随机）
+      provider       : 模型服务商，"deepseek" / "doubao" / "kimi"
+      system         : 系统提示词（设定 AI 角色和行为规则）
+      user           : 用户消息（你想让 AI 回答的内容）
+      messages       : 多轮对话时直接传完整消息列表，此时 system/user 会被忽略
+      model_override : 强制指定模型名，覆盖环境变量中的默认值
+      temperature    : 创造力（0=确定性高, 1=更随机）
+      response_format: 结构化输出，如 {"type": "json_object"}（DeepSeek/豆包/Kimi 均支持）
 
     自动处理：
       - 429 限流 / 5xx 服务器错误 → 指数退避重试，最多 3 次
@@ -123,29 +125,31 @@ def chat_completion(
     if not model:
         raise ValueError(f"Missing model for provider: {provider}. Set env e.g. DEEPSEEK_MODEL.")
 
-    # 如果没传 messages，就用 system + user 构建单轮对话
     if messages is None:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
 
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if response_format:
+        kwargs["response_format"] = response_format
+
     last_error = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-            )
+            resp = client.chat.completions.create(**kwargs)
             return (resp.choices[0].message.content or "").strip()
         except Exception as e:
             last_error = e
             is_timeout = "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower()
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
-            # 只在可恢复的错误（限流/服务器错误/超时）时重试
             if attempt < MAX_RETRIES and (status in (429, 500, 502, 503) or is_timeout):
-                time.sleep(BASE_DELAY * (2 ** attempt))  # 2s → 4s → 8s
+                time.sleep(BASE_DELAY * (2 ** attempt))
                 continue
             raise
     raise last_error  # type: ignore[misc]

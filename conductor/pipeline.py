@@ -151,19 +151,33 @@ class Pipeline:
             self.run.error = "没有选中的创意"
             return False
 
-        self.run.draft = create_content(
-            idea=self.run.selected_idea,
-            brand=self.task.brand,
-            target_platforms=[p.value for p in self.task.target_platforms],
-            persona=self.task.persona,
-            target_audience=self.task.target_audience,
-            content_goals=self.task.content_goals,
-        )
-        self.run.draft = review_quality(self.run.draft)
-        log.info("内容质量分: %.2f", self.run.draft.quality_score)
+        platforms = [p.value for p in self.task.target_platforms]
+        max_revisions = 2
+        for revision in range(max_revisions + 1):
+            revision_feedback = ""
+            if revision > 0 and self.run.draft:
+                revision_feedback = self.run.draft.quality_feedback
+                log.info("质量不达标(%.2f)，第 %d 次修改: %s",
+                         self.run.draft.quality_score, revision, revision_feedback[:100])
+
+            self.run.draft = create_content(
+                idea=self.run.selected_idea,
+                brand=self.task.brand,
+                target_platforms=platforms,
+                persona=self.task.persona,
+                target_audience=self.task.target_audience,
+                content_goals=self.task.content_goals,
+                revision_feedback=revision_feedback,
+            )
+            self.run.draft = review_quality(self.run.draft)
+            log.info("内容质量分: %.2f (第 %d 版)", self.run.draft.quality_score, revision + 1)
+
+            if self.run.draft.quality_score >= self.safety.min_quality_score:
+                break
 
         if self.run.draft.quality_score < self.safety.min_quality_score:
-            log.warning("质量分低于阈值: %.2f < %.2f", self.run.draft.quality_score, self.safety.min_quality_score)
+            log.warning("经 %d 次修改仍低于阈值: %.2f < %.2f（保留供人工判断）",
+                        max_revisions, self.run.draft.quality_score, self.safety.min_quality_score)
 
         _save_draft_to_store(self.run)
 

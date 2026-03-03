@@ -79,9 +79,26 @@ def refine_brief(topic: str, context: str) -> str:
 
 
 def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tuple[int, str, str]]) -> str:
+    """用 AgentLoop 执行规划步骤——LLM 在思考过程中可随时搜索补充信息。"""
+    from core.agent import AgentLoop
+    from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, FETCH_URL_TOOL, TRENDING_TOOL
+
     step_cfg = STEP_PROMPTS[step_num]
     system = step_cfg["system"]
     instruction = step_cfg["instruction"]
+
+    system += (
+        "\n\n你拥有搜索工具。如果在分析过程中需要数据支撑（市场数据、竞品信息、行业趋势、"
+        "政策法规等），请主动调用工具搜索，不要凭空编造数据。"
+        "但也不要过度搜索——只在确实需要外部信息时才用。"
+    )
+
+    try:
+        from core.skill_router import enrich_prompt
+        system = enrich_prompt(system, user_text=topic, bot_type="planner")
+    except Exception:
+        pass
+
     parts = [f"规划主题：{topic}"]
     if context:
         parts.append(f"背景材料：{context[:6000]}")
@@ -90,16 +107,27 @@ def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tup
     parts.append(instruction)
     parts.append("标了「如相关才写」的字段，不相关就跳过。像正常人说话，不要贴框架名当标签。")
     user_msg = "\n\n".join(parts)
+
     try:
-        from core.skill_router import enrich_prompt
-        system = enrich_prompt(system, user_text=user_msg, bot_type="planner")
-    except Exception:
-        pass
-    try:
-        return chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+        agent = AgentLoop(
+            provider=PROVIDER,
+            system=system,
+            max_rounds=5,
+            temperature=0.7,
+            on_tool_call=lambda name, args: print(f"  🔍 [{name}] {str(args)[:80]}", flush=True),
+        )
+        agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, FETCH_URL_TOOL, TRENDING_TOOL])
+        result = agent.run(user_msg)
+        if result.tool_calls_made:
+            print(f"  [第{step_num}步] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+        return result.content
     except Exception as e:
-        print(f"[规划] 第{step_num}步 LLM 调用失败: {e}", flush=True)
-        return f"（第{step_num}步生成失败，请稍后重试）"
+        print(f"[规划] 第{step_num}步 AgentLoop 失败({e}), 回退到简单调用", flush=True)
+        try:
+            return chat_completion(provider=PROVIDER, system=system, user=user_msg).strip()
+        except Exception as e2:
+            print(f"[规划] 第{step_num}步 回退也失败: {e2}", flush=True)
+            return f"（第{step_num}步生成失败，请稍后重试）"
 
 
 def _judge_search_need(topic: str, context: str) -> dict:
@@ -300,11 +328,8 @@ def run_planning(
         else:
             print("[需求结构化] 调用失败，使用原始输入。", flush=True)
 
-    # ── 信息补充（联网搜索）──
-    search_context = research_for_planning(topic, context)
-    if search_context:
-        session_lines.extend(["## 联网搜索补充", "", search_context, "", "---", ""])
-        context = context + "\n\n【联网搜索补充材料】\n" + search_context
+    # 每个规划步骤自带搜索工具，无需预搜索。
+    # 保留 research_for_planning 用于显式"研究 XX"命令。
 
     print(f"[规划开始] 模式: {mode}", flush=True)
     print(f"  主题: {topic[:120]}{'...' if len(topic) > 120 else ''}", flush=True)

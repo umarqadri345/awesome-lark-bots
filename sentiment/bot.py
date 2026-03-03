@@ -315,6 +315,29 @@ def _extract_text(content: str) -> str:
 _running_sessions: dict[str, str] = {}
 _running_lock = threading.Lock()
 
+def _send_sentiment_handoff(reply_fn, title: str, keywords: str, stats: str) -> None:
+    """发送舆情结果的下一步引导：需要谁看、需要决策什么、可以交给AI分析什么。"""
+    try:
+        stats_short = stats[:400] if stats else "（见上方报告）"
+        handoff = (
+            f"**🧑 需要人来判断：**\n"
+            f"1. [品牌/公关负责人] 有没有需要立即回应的负面舆情？是否需要启动危机预案？\n"
+            f"2. [内容团队] 用户讨论中有没有可以借势做内容的热点话题？\n"
+            f"3. [管理层] 整体舆论走势是否符合预期？需要调整策略吗？\n"
+            f"\n**🤖 交给AI深度分析（可直接复制）：**\n"
+            f"我们刚完成舆情采集「{title}」，关键词：{keywords}。\n"
+            f"数据概况：{stats_short}\n"
+            f"请分析：1.情感倾向分布及主要论点 2.风险点和可能发酵的话题 3.机会洞察 4.行动建议。"
+        )
+        reply_fn(make_card("📋 下一步：问对问题", [
+            {"text": handoff},
+            {"divider": True},
+            {"note": "🧑 人的部分 → 找对应的人确认  ·  🤖 AI的部分 → 复制给 Claude/Opus"},
+        ], color="indigo"))
+    except Exception:
+        pass
+
+
 # ── 消息处理 ─────────────────────────────────────────────────
 
 def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -414,12 +437,18 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         format_result_message(result),
                         next_actions=["再来一份报告", "加 +分析 看 AI 解读"],
                     ))
+                    _send_sentiment_handoff(
+                        _reply_c, profile['title'],
+                        ', '.join(profile.get('keywords', [])[:5]),
+                        result.stats_summary if hasattr(result, 'stats_summary') else "",
+                    )
                     try:
                         from core.events import emit as _emit_event
                         _emit_event("sentiment", "report_completed",
                                     f"舆情报告完成: {profile['title']}",
                                     user_id=uid or "",
-                                    meta={"profile_id": profile_id, "with_ai": with_ai})
+                                    meta={"profile_id": profile_id, "topic": profile['title'][:100],
+                                           "keywords": profile.get('keywords', [])[:5], "with_ai": with_ai})
                     except Exception:
                         pass
                 finally:
@@ -453,12 +482,18 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         format_result_message(result),
                         next_actions=["换个关键词再采", "加 +分析 看 AI 解读"],
                     ))
+                    _send_sentiment_handoff(
+                        _reply_c, f"自定义采集: {', '.join(keywords[:3])}",
+                        ', '.join(keywords[:5]),
+                        result.stats_summary if hasattr(result, 'stats_summary') else "",
+                    )
                     try:
                         from core.events import emit as _emit_event
                         _emit_event("sentiment", "report_completed",
                                     f"采集完成: {', '.join(keywords[:3])}",
                                     user_id=uid or "",
-                                    meta={"keywords": keywords[:5], "with_ai": with_ai})
+                                    meta={"topic": ', '.join(keywords[:3]),
+                                           "keywords": keywords[:5], "with_ai": with_ai})
                     except Exception:
                         pass
                 finally:

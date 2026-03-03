@@ -307,7 +307,8 @@ def _final_delivery_card(final_output: str) -> dict:
 
 
 def _done_card_with_followup(topic: str, path: str) -> dict:
-    """脑暴完成卡片：引导用户进入 follow-up 追问。"""
+    """脑暴完成卡片：引导用户进入 follow-up 追问 + 跨 Bot 联动。"""
+    short_topic = topic[:60]
     return result_card(
         "脑暴完成",
         fields=[("主题", topic[:100]), ("会话文件", f"`{path}`")],
@@ -316,6 +317,10 @@ def _done_card_with_followup(topic: str, path: str) -> dict:
             "「深入方向1」展开某个方向",
             "「新主题」开始新脑暴",
             "去飞书群看完整讨论",
+            "━━ 用这个结果继续 ━━",
+            f"去「自媒体助手」发「脑暴：{short_topic}」→ 生成内容",
+            f"去「规划」发「{short_topic}」→ 细化成可执行计划",
+            f"去「助理bot」发「备忘 跟进脑暴结论 #项目名」→ 记录待办",
         ],
     )
 

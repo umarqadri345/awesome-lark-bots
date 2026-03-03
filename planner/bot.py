@@ -255,6 +255,44 @@ _CHAT_SYSTEM = PLANNER_SYSTEM + """
 """
 
 
+def _build_handoff_prompt(topic: str, planning_outputs: list) -> str:
+    """用 LLM 从规划结果中提炼：关键待决策问题 + 可交给AI/人的精炼 prompt。"""
+    if not planning_outputs:
+        return ""
+    steps_text = ""
+    for step_num, step_name, step_output in planning_outputs[-3:]:
+        steps_text += f"\n### {step_name}\n{step_output[:1500]}\n"
+    try:
+        from core.llm import chat_completion
+        result = chat_completion(
+            provider="deepseek",
+            system=(
+                "你是一个帮团队「问对问题」的助手。团队刚完成了一次规划，你要帮他们提炼出：\n"
+                "1. **需要人决策的问题**（2-3个）：这个方案里哪些关键假设需要谁来确认？哪些取舍需要老板/客户/专家拍板？写清楚「问谁」「问什么」「为什么这个判断很关键」。\n"
+                "2. **交给AI深化的 prompt**（1段）：一段可直接复制给 Claude/Opus 的 prompt，带上核心上下文，请AI帮忙深化方案。\n\n"
+                "输出格式：\n"
+                "**🧑 需要人来判断：**\n"
+                "1. [问谁] 问题内容（为什么关键）\n"
+                "2. ...\n\n"
+                "**🤖 交给AI深化（可直接复制）：**\n"
+                "以下是我们对「主题」的规划结果...\n\n"
+                "要求：简洁有力，每个问题一两句话说清楚。不要废话。"
+            ),
+            user=f"规划主题：{topic[:200]}\n\n规划结果：{steps_text}",
+            temperature=0.3,
+        ).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception:
+        pass
+    return (
+        f"**🧑 需要人来判断：**\n"
+        f"（LLM 提炼失败，请根据上方规划结果自行判断关键决策点）\n\n"
+        f"**🤖 交给AI深化（可直接复制）：**\n"
+        f"以下是我们团队对「{topic[:100]}」的规划结果，请帮我们深化为可执行方案。\n{steps_text[:2000]}"
+    )
+
+
 def _generate_short_title(topic: str) -> str:
     """用 LLM 将冗长话题凝练为文档标题（≤15字）。"""
     try:
@@ -915,10 +953,18 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             _log(f"启动规划: topic={topic[:80]!r} mode={mode}")
             try:
                 path, planning_outputs = run_planning(topic=topic, context=context, mode=mode)
+                short_topic = topic[:60]
                 done_card = result_card(
                     "规划完成",
                     fields=[("主题", topic[:100]), ("模式", mode)],
-                    next_actions=["回复数字生成文档", "直接追问规划内容", "发「结束讨论」退出追问模式"],
+                    next_actions=[
+                        "回复数字生成文档",
+                        "直接追问规划内容",
+                        "发「结束讨论」退出追问模式",
+                        "━━ 用这个结果继续 ━━",
+                        f"去「自媒体助手」发「{short_topic}」→ 生成传播内容",
+                        f"去「助理bot」发「创建项目 {short_topic[:20]}」→ 纳入项目管理",
+                    ],
                 )
                 if uid:
                     send_card_to_user(uid, done_card)
@@ -959,6 +1005,20 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     send_card_to_user(uid, menu_card)
                 else:
                     reply_card(mid, menu_card)
+
+                # 生成交给最强AI的 handoff prompt
+                time.sleep(0.5)
+                handoff = _build_handoff_prompt(topic, planning_outputs)
+                if handoff:
+                    handoff_card = make_card("📋 下一步：问对问题", [
+                        {"text": handoff},
+                        {"divider": True},
+                        {"note": "🧑 人的部分 → 找对应的人确认  ·  🤖 AI的部分 → 复制给 Claude/Opus"},
+                    ], color="indigo")
+                    if uid:
+                        send_card_to_user(uid, handoff_card)
+                    else:
+                        reply_card(mid, handoff_card)
 
                 try:
                     from core.events import emit as _emit_event

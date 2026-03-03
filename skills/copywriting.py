@@ -95,4 +95,24 @@ class CopywritingSkill(Skill):
         return "\n".join(parts)
 
 
+    def as_tool(self):
+        from core.agent import ToolDef
+        skill = self
+
+        def _query(name: str = "") -> str:
+            return skill.get_context(framework=name)
+
+        return ToolDef(
+            name="get_copywriting_framework",
+            description="获取文案写作框架（AIDA/PAS/FAB/SCQA/Hook-Story-Offer/4U）。留空查全部概览。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "框架名称，留空查全部"},
+                },
+            },
+            fn=_query,
+        )
+
+
 register(CopywritingSkill())

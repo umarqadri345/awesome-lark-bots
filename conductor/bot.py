@@ -135,6 +135,15 @@ def _get_session(user_key: str) -> dict:
         return session
 
 
+def _record_team_decision(category: str, decision: str, *, source: str = "conductor"):
+    """安全地记录一条团队决策（失败静默）。"""
+    try:
+        from skills.team_decisions import record_decision
+        record_decision(category, decision, source=source)
+    except Exception:
+        pass
+
+
 # ── 消息处理 ──────────────────────────────────────────────────
 
 def _extract_text(content: str) -> str:
@@ -256,7 +265,17 @@ def _dispatch(mid: str, text: str, uid: Optional[str], user_key: str):
         session["pending_topic"] = ""
         topic = pending
         deep_mode = lower in ("脑暴", "深度")
-        # 下面会用到 topic, deep_mode，直接落到下方「启动 pipeline」逻辑
+    elif ask_mode and pending and lower not in ("脑暴", "深度", "快速", "开始", "执行") and len(t) < 100:
+        # 用户在选模式阶段补充了信息，合并到选题中重新确认
+        merged = f"{pending}（{t}）"
+        session["pending_topic"] = merged
+        refine_text = _refine_topic_preview(merged, session)
+        reply_card(mid, _card("选题已更新", [
+            {"text": refine_text},
+            {"divider": True},
+            {"text": "回复 **脑暴** / **快速** 选择模式，或继续补充信息"},
+        ], color="indigo"))
+        return
     else:
         topic = None
         deep_mode = None
@@ -278,13 +297,15 @@ def _dispatch(mid: str, text: str, uid: Optional[str], user_key: str):
             deep_mode = False
             topic = re.sub(r'^快速\s*[：:]\s*', '', t, flags=re.IGNORECASE).strip()
         else:
-            # 纯选题：若开启「提选题时可选模式」，先让用户选脑暴/快速
+            # 纯选题：先帮用户结构化理解，再选模式
             if ask_mode:
                 session["pending_topic"] = t
-                reply_card(mid, _card("请选择执行模式", [
-                    {"text": f"**选题：**{t[:200]}"},
+                refine_text = _refine_topic_preview(t, session)
+                reply_card(mid, _card("选题确认", [
+                    {"text": refine_text},
+                    {"divider": True},
                     {"text": "回复 **脑暴** 或 **深度** → 脑暴讨论后生成内容（约 5–15 分钟）\n回复 **快速** 或 **开始** → 直接创意+创作（约 1–3 分钟）"},
-                    {"note": "也可下次直接发「脑暴：选题」或「快速：选题」一步到位"},
+                    {"note": "也可补充信息（如「偏休闲风」），我会更新理解后再问你"},
                 ], color="indigo"))
                 with _running_lock:
                     _running.pop(user_key, None)
@@ -351,6 +372,20 @@ def _dispatch(mid: str, text: str, uid: Optional[str], user_key: str):
                 send_card_to_user(uid, card)
             else:
                 reply_card(mid, card)
+            # 生成交给最强AI的 handoff prompt
+            if run.status == "completed" and run.draft:
+                handoff = _build_handoff_prompt(run, topic)
+                if handoff:
+                    handoff_card = _card("📋 下一步：问对问题", [
+                        {"text": handoff},
+                        {"divider": True},
+                        {"note": "🧑 人的部分 → 找对应的人确认  ·  🤖 AI的部分 → 复制给 Claude/Opus"},
+                    ], color="indigo")
+                    if uid:
+                        send_card_to_user(uid, handoff_card)
+                    else:
+                        reply_card(mid, handoff_card)
+
             try:
                 from core.events import emit as _emit_event
                 _title = run.selected_idea.title[:40] if run.selected_idea else topic[:40]
@@ -537,6 +572,7 @@ def _cmd_brand(mid: str, user_key: str, brand: str):
         reply_card(mid, _card("当前品牌", [{"text": f"当前品牌：**{current}**\n\n切换：发送「品牌 品牌名」"}], color="purple"))
         return
     session["brand"] = brand
+    _record_team_decision("brand_tone", f"当前使用品牌：{brand}", source="conductor")
     reply_card(mid, _card("品牌已切换", [{"text": f"当前品牌：**{brand}**"}], color="green"))
 
 
@@ -572,6 +608,7 @@ def _cmd_persona(mid: str, user_key: str, persona: str):
         ], color="purple"))
         return
     session["persona"] = persona
+    _record_team_decision("brand_tone", f"发帖人设：{persona}", source="conductor")
     reply_card(mid, _card("人设已设置", [{"text": f"**{persona[:80]}**"}], color="green"))
 
 
@@ -585,6 +622,7 @@ def _cmd_target_audience(mid: str, user_key: str, audience: str):
         ], color="purple"))
         return
     session["target_audience"] = audience
+    _record_team_decision("audience", f"目标受众：{audience}", source="conductor")
     reply_card(mid, _card("目标受众已设置", [{"text": f"**{audience[:80]}**"}], color="green"))
 
 
@@ -598,10 +636,75 @@ def _cmd_content_goals(mid: str, user_key: str, goals: str):
         ], color="purple"))
         return
     session["content_goals"] = goals
+    _record_team_decision("strategy", f"内容目标：{goals}", source="conductor")
     reply_card(mid, _card("内容目标已设置", [{"text": f"**{goals[:80]}**"}], color="green"))
 
 
 # ── 结果格式化 ────────────────────────────────────────────────
+
+def _refine_topic_preview(topic: str, session: dict) -> str:
+    """快速结构化用户的选题输入，帮用户确认理解是否正确。"""
+    brand = session.get("brand") or "（未指定）"
+    platforms = ", ".join(session.get("platforms", ["xiaohongshu"]))
+    persona = session.get("persona", "")
+    audience = session.get("target_audience", "")
+
+    try:
+        from core.llm import chat_completion
+        result = chat_completion(
+            provider="deepseek",
+            system=(
+                "用户给了一个自媒体内容选题，请用 3-4 行帮他确认你的理解。格式：\n"
+                "**选题：**一句话总结\n"
+                "**内容方向：**你理解的内容切入点\n"
+                "**建议补充：**如果有模糊的地方，列 1-2 个简短问题（如「偏哪种风格？」）\n"
+                "不要写长文，控制在 100 字以内。只输出结构化内容，不要解释。"
+            ),
+            user=f"选题：{topic[:200]}\n平台：{platforms}\n品牌：{brand}",
+            temperature=0.3,
+        ).strip()
+        if result and len(result) > 10:
+            return result
+    except Exception:
+        pass
+    return (
+        f"**选题：**{topic[:200]}\n"
+        f"**平台：**{platforms}  |  **品牌：**{brand}\n"
+        + (f"**人设：**{persona[:60]}\n" if persona else "")
+        + (f"**受众：**{audience[:60]}\n" if audience else "")
+    )
+
+
+def _build_handoff_prompt(run: PipelineRun, topic: str) -> str:
+    """从内容生成结果中提炼：需要人判断的问题 + 可交给AI优化的 prompt。"""
+    if not run.draft:
+        return ""
+    idea = run.selected_idea
+    draft = run.draft
+    first_copy = ""
+    if draft.platform_copy:
+        first_plat = list(draft.platform_copy.keys())[0]
+        first_copy = draft.platform_copy[first_plat][:600]
+
+    title = idea.title if idea else topic[:60]
+    angle = idea.angle if idea else "—"
+    hook = idea.hook if idea else "—"
+    score = f"{draft.quality_score:.0%}"
+    feedback = draft.quality_feedback
+
+    return (
+        f"**🧑 需要人来判断：**\n"
+        f"1. [审批人] 这条内容的调性对吗？标题「{title[:30]}」和品牌形象一致吗？\n"
+        f"2. [了解受众的人] 钩子「{hook[:40]}」能让目标受众停下来吗？有没有更贴近他们痛点的说法？\n"
+        f"3. [发布负责人] 发布时间定什么时候？要配什么话题标签蹭热度？\n"
+        f"\n**🤖 交给AI优化（可直接复制）：**\n"
+        f"我们为「{topic[:80]}」生成了一条自媒体内容，请帮优化。\n"
+        f"创意：{title} / 角度：{angle} / 钩子：{hook}\n"
+        f"文案：{first_copy[:400]}\n"
+        f"AI自评：{score}，{feedback}\n"
+        f"请从受众视角评估吸引力，指出文案最弱部分并改写，给3个替代钩子。"
+    )
+
 
 def _format_result_card(run: PipelineRun) -> dict:
     if run.status == "failed":
@@ -655,9 +758,15 @@ def _format_result_card(run: PipelineRun) -> dict:
     if content_id:
         next_steps += f"- 发送「详情 {content_id}」查看完整内容\n"
         next_steps += f"- 发送「发布 {content_id}」审批通过\n"
+        next_steps += f"- 发送「自动发布 {content_id} 小红书」浏览器自动发\n"
         next_steps += f"- 发送「定时 {content_id} 10:00」定时发布\n"
     next_steps += "- 发送新主题继续生产\n"
-    next_steps += "- 发送「草稿」查看所有内容"
+    next_steps += "- 发送「草稿」查看所有内容\n"
+    topic_short = run.selected_idea.title[:40] if run.selected_idea else ""
+    if topic_short:
+        next_steps += f"\n**💡 跨 Bot 联动：**\n"
+        next_steps += f"- 去「助理bot」发「备忘 跟进{topic_short}发布效果」→ 设提醒\n"
+        next_steps += f"- 去「舆情监控」发「{topic_short}」→ 追踪传播效果"
     sections.append({"text": next_steps})
 
     sections.append({"note": f"run_id: {run.run_id}  |  耗时: {run.elapsed_sec():.0f}s  |  状态: {run.status}"})

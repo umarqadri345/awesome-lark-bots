@@ -245,5 +245,38 @@ class BrandSkill(Skill):
             return str(brand)
         return self.brand_to_prompt(brand)
 
+    def as_tool(self):
+        from core.agent import ToolDef
+
+        def _query(brand_name: str, aspect: str = "all") -> str:
+            brand = self.load_brand(brand_name)
+            if not brand:
+                available = [b["name"] for b in self.list_brands()]
+                return f"未找到品牌 '{brand_name}'。可用：{', '.join(available) if available else '无'}"
+            if aspect == "all":
+                return self.brand_to_prompt(brand)
+            aspect_sections = {"tone": "tone", "visual": "visual", "scenes": "scenes", "characters": "characters"}
+            key = aspect_sections.get(aspect)
+            if key and key in brand:
+                import json
+                val = brand[key]
+                return json.dumps(val, ensure_ascii=False, indent=2) if isinstance(val, (dict, list)) else str(val)
+            return self.brand_to_prompt(brand)
+
+        return ToolDef(
+            name="get_brand_info",
+            description="查询品牌知识库：调性、视觉风格、场景、角色等。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "brand_name": {"type": "string", "description": "品牌名称"},
+                    "aspect": {"type": "string", "description": "查询维度：all/tone/visual/scenes/characters",
+                               "enum": ["all", "tone", "visual", "scenes", "characters"]},
+                },
+                "required": ["brand_name"],
+            },
+            fn=_query,
+        )
+
 
 register(BrandSkill())

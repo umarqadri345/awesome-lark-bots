@@ -122,4 +122,25 @@ class PlatformSkill(Skill):
         return "\n\n".join(chunks) if chunks else ""
 
 
+    def as_tool(self):
+        from core.agent import ToolDef
+        skill = self
+
+        def _query(platform: str) -> str:
+            return skill.get_context(platforms=[platform]) or f"未找到 {platform} 的运营指南"
+
+        return ToolDef(
+            name="get_platform_guide",
+            description="获取平台运营指南：算法规则、内容规范、字数限制、最佳实践。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "description": "平台名(xiaohongshu/douyin/bilibili/weibo/kuaishou/zhihu)"},
+                },
+                "required": ["platform"],
+            },
+            fn=_query,
+        )
+
+
 register(PlatformSkill())

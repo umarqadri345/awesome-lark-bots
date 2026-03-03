@@ -47,10 +47,34 @@ def _format_memos(memos: List[dict]) -> str:
 
 
 def _scan_bot_activity(hours: int = 24) -> str:
-    """扫描其他 bot 最近的产出。"""
-    cutoff = time.time() - hours * 3600
+    """扫描其他 bot 最近的产出，优先使用事件系统，兜底文件扫描。"""
     activity = []
 
+    try:
+        from core.events import scan as scan_events
+        events = scan_events(hours=hours)
+        if events:
+            by_bot: dict[str, list] = {}
+            for e in events:
+                bot = e.get("bot", "unknown")
+                by_bot.setdefault(bot, []).append(e)
+            for bot, bot_events in sorted(by_bot.items()):
+                summaries = []
+                for e in bot_events[-5:]:
+                    topic = (e.get("meta") or {}).get("topic", "")
+                    summary = e.get("summary", "")
+                    if topic and topic not in summary:
+                        summaries.append(f"{summary}（{topic[:30]}）")
+                    else:
+                        summaries.append(summary)
+                activity.append(f"  - {bot}: {len(bot_events)} 条动态")
+                for s in summaries:
+                    activity.append(f"    · {s}")
+            return "\n".join(activity)
+    except Exception:
+        pass
+
+    cutoff = time.time() - hours * 3600
     project_root = Path(__file__).resolve().parent.parent
     runs_dir = project_root / "runs"
     if runs_dir.exists():
@@ -247,8 +271,9 @@ def generate_daily_brief(
 2. 今日重点（从备忘+日程+线程+项目中提炼，最多3条）
 3. 线程概览（哪些线程最近活跃，用一句话说）
 4. 项目状态（预算执行、目标进度，有异常的优先提醒：超支、目标即将到期等）
-5. 需要注意（冲突、到期提醒、近期节点、沉寂的线程、预算告警等）
-6. 一句话建议（今天的工作节奏建议）
+5. 团队动态（基于 bot 动态，有什么值得跟进的：脑暴结果需要推进？内容待审批？舆情需要关注？）
+6. 需要注意（冲突、到期提醒、近期节点、沉寂的线程、预算告警等）
+7. 建议操作（根据以上信息，具体告诉用户今天可以做的 1-3 件事，格式如"去 XX 机器人发 YY"）
 
 语言：中文，不要使用 Markdown 加粗，纯文本。"""
     else:
@@ -271,9 +296,11 @@ def generate_daily_brief(
 
 请输出：
 1. 今日回顾（线程进展 + 今日花费/项目动态）
-2. 项目提醒（预算使用率 >80% 告警、目标即将到期等）
-3. 明日可提前准备的事项（最多3条）
-4. 一句话收尾建议
+2. 团队动态（基于 bot 动态：今天完成了什么脑暴/规划/内容？有什么结果需要跟进？）
+3. 项目提醒（预算使用率 >80% 告警、目标即将到期等）
+4. 待跟进事项（有没有脑暴结论还没推进？内容草稿还没审批？舆情需要关注？）
+5. 明日可提前准备的事项（最多3条）
+6. 一句话收尾建议
 
 语言：中文，简洁，不要 Markdown 加粗。"""
 

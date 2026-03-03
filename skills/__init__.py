@@ -58,6 +58,15 @@ class Skill(ABC):
             return any(kw.lower() in lower for kw in self.trigger_keywords)
         return False
 
+    def as_tool(self) -> "Optional[dict]":
+        """
+        返回 ToolDef 实例，让此 skill 可被 AgentLoop 主动调用。
+        默认返回 None（不支持工具模式）。子类可覆写。
+
+        返回值应为 core.agent.ToolDef 实例，包含 name、description、parameters、fn。
+        """
+        return None
+
     def __repr__(self) -> str:
         return f"<Skill:{self.name}>"
 
@@ -94,6 +103,22 @@ def load_context(skill_name: str, **kwargs) -> str:
         return skill.get_context(**kwargs)
     except Exception:
         return ""
+
+
+def collect_tools() -> list:
+    """
+    收集所有支持工具模式的 skill，返回 ToolDef 列表。
+    用于 AgentLoop 批量注册。
+    """
+    tools = []
+    for s in list_skills():
+        try:
+            tool = s.as_tool()
+            if tool is not None:
+                tools.append(tool)
+        except Exception:
+            continue
+    return tools
 
 
 # ── 自动发现：import skills 时扫描本目录下所有模块并触发注册 ──

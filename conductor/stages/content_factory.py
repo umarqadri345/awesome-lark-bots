@@ -29,30 +29,27 @@ except ImportError:
 
 COPYWRITING_SYSTEM = """你是顶级自媒体文案专家。根据内容创意，为每个目标平台生成完整的发布文案。
 
-每个平台的文案要适配该平台的调性：
-- 小红书：标题用 emoji + 关键词吸引点击，正文口语化、有干货感，结尾引导互动
-- 抖音：开头3秒抓人，文案简短有力，多用热门话题标签
-- B站：标题有信息量，正文可稍长，注重内容价值
-- 微博：短平快，带话题标签，适合传播
-- 知乎：专业深度，回答式结构
+你拥有工具。写文案前请务必：
+1. 查 get_platform_guide — 了解目标平台的算法规则、内容规范、字数限制
+2. 查 get_copywriting_framework — 选择合适的文案框架（如 AIDA、PAS、Hook-Story-Offer）
+3. 查 get_team_decisions — 了解团队的内容偏好和调性要求
+4. 如需灵感 → 用 search_platform 搜索相关话题的爆款文案，学习表达方式
 
 重要：title 和 body 必须是「可直接发到该平台的纯发布文案」。
-- 禁止在 body 中写入：格式说明（如「格式二：观测记录」）、分隔线（---）、视觉/画面描述（如「（长图左：…右：…）」）、内部标注、给 AI 用的 prompt 或观测记录。正文只能是用户看到的成品文案和话题标签。
-- hashtags 单独放在数组里，每条以 # 开头，不要在 body 里重复堆砌多遍。
+- 禁止在 body 中写入格式说明、分隔线、画面描述、内部标注
+- hashtags 单独放在数组里，不在 body 里重复
 
-输出 JSON：
+最终输出 JSON：
 {
   "platform_copy": {
     "平台名": {
-      "title": "发布标题（一句话，可直接作标题）",
-      "body": "正文（纯发布文案，无格式说明无画面描述）",
-      "hashtags": ["#标签1", "#标签2", "#标签3"]
+      "title": "发布标题",
+      "body": "正文（纯发布文案）",
+      "hashtags": ["#标签1", "#标签2"]
     }
   },
-  "visual_description": "视觉内容的中文描述（给 creative prompt 模块用）"
-}
-
-只输出 JSON。"""
+  "visual_description": "视觉内容的中文描述"
+}"""
 
 
 QUALITY_SYSTEM = """你是内容质量审核专家。评估以下自媒体内容的质量。
@@ -81,12 +78,19 @@ def create_content(
     persona: str = "",
     target_audience: str = "",
     content_goals: str = "",
+    revision_feedback: str = "",
 ) -> ContentDraft:
-    """根据创意生成完整内容包：文案 + 视觉 prompt。"""
+    """用 AgentLoop + 工具生成内容包：文案 + 视觉 prompt。LLM 可主动查平台规范、竞品、文案框架。"""
+    from core.agent import AgentLoop
+    from core.tools import (
+        WEB_SEARCH_TOOL, SEARCH_PLATFORM_TOOL, BRAND_INFO_TOOL,
+        PLATFORM_GUIDE_TOOL, COPYWRITING_FRAMEWORK_TOOL, TEAM_DECISIONS_TOOL,
+    )
+
     platforms = target_platforms or [idea.target_platform or "xiaohongshu"]
     draft = ContentDraft(idea=idea)
 
-    # ── 1. 生成各平台文案 ──
+    # ── 1. 用 AgentLoop 生成各平台文案 ──
     log.info("生成文案: %s → %s", idea.title, platforms)
     extra = []
     if persona:
@@ -95,42 +99,54 @@ def create_content(
         extra.append(f"目标受众：{target_audience}")
     if content_goals:
         extra.append(f"内容目标：{content_goals}")
-    extra_block = "\n".join(extra) if extra else ""
 
-    copy_prompt = f"""内容创意：
-标题：{idea.title}
-切入角度：{idea.angle}
-开头钩子：{idea.hook}
-内容形式：{idea.content_type}
-{'品牌：' + brand if brand else ''}
-
-目标平台：{', '.join(platforms)}
-{extra_block}
-
-请为每个平台生成适配的发布文案。"""
+    copy_prompt = (
+        f"内容创意：\n标题：{idea.title}\n角度：{idea.angle}\n钩子：{idea.hook}\n"
+        f"形式：{idea.content_type}\n{'品牌：' + brand if brand else ''}\n"
+        f"目标平台：{', '.join(platforms)}\n"
+        + ("\n".join(extra) + "\n" if extra else "")
+        + "\n请先用工具调研平台规范和竞品，再为每个平台生成文案。最终输出 JSON。"
+    )
+    if revision_feedback:
+        copy_prompt += f"\n\n上一版反馈（请针对性改进）：{revision_feedback}"
 
     try:
-        from core.skill_router import enrich_prompt
-        enriched_system = enrich_prompt(COPYWRITING_SYSTEM, user_text=copy_prompt, bot_type="conductor")
-        raw = chat_completion(provider="deepseek", system=enriched_system, user=copy_prompt, temperature=0.7)
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        data = json.loads(json_match.group() if json_match else raw)
+        agent = AgentLoop(
+            provider="deepseek",
+            system=COPYWRITING_SYSTEM,
+            temperature=0.7,
+            max_rounds=6,
+            response_format={"type": "json_object"},
+            on_tool_call=lambda name, args: log.info("文案调研: %s(%s)", name, str(args)[:80]),
+        )
+        agent.add_tools([
+            WEB_SEARCH_TOOL, SEARCH_PLATFORM_TOOL, BRAND_INFO_TOOL,
+            PLATFORM_GUIDE_TOOL, COPYWRITING_FRAMEWORK_TOOL, TEAM_DECISIONS_TOOL,
+        ])
 
-        for plat, content in data.get("platform_copy", {}).items():
-            title = content.get("title", "")
-            body = content.get("body", "")
-            tags = content.get("hashtags", [])
-            full_text = f"{title}\n\n{body}\n\n{' '.join(tags)}"
-            draft.platform_copy[plat] = full_text
-            draft.hashtags.extend(tags)
+        parsed, result = agent.run_json(copy_prompt)
+        log.info("文案生成完成: %d 轮, %d 次工具调用", result.rounds_used, len(result.tool_calls_made))
 
-        visual_desc = data.get("visual_description", idea.title)
-        draft.text_content = visual_desc
+        if parsed:
+            for plat, content in (parsed.get("platform_copy", {})).items():
+                if isinstance(content, dict):
+                    title = content.get("title", "")
+                    body = content.get("body", "")
+                    tags = content.get("hashtags", [])
+                    full_text = f"{title}\n\n{body}\n\n{' '.join(tags)}"
+                    draft.platform_copy[plat] = full_text
+                    draft.hashtags.extend(tags)
+                elif isinstance(content, str):
+                    draft.platform_copy[plat] = content
+
+            visual_desc = parsed.get("visual_description", idea.title)
+            draft.text_content = visual_desc
+        else:
+            raise ValueError("JSON parse failed")
     except Exception as e:
-        log.error("文案生成失败: %s", e)
-        draft.text_content = f"{idea.title}\n{idea.angle}"
-        for plat in platforms:
-            draft.platform_copy[plat] = f"{idea.title}\n\n{idea.angle}\n\n{idea.hook}"
+        log.warning("AgentLoop 文案生成失败(%s), 回退到简单模式", e)
+        draft = _create_content_fallback(idea, brand, platforms, persona, target_audience,
+                                         content_goals, revision_feedback)
 
     # ── 2. 生成视觉素材 Prompt（调用 creative 模块）──
     log.info("生成视觉 Prompt...")
@@ -149,18 +165,18 @@ def create_content(
                 "请生成完整的视觉素材 Prompt（中文结构化 + Seedance 英文版 + 配套文案）。"
             )
 
-            result = chat_completion(provider="deepseek", system=system_prompt, user=user_prompt, temperature=0.7)
-            draft.visual_prompt = result
+            result_text = chat_completion(provider="deepseek", system=system_prompt, user=user_prompt, temperature=0.7)
+            draft.visual_prompt = result_text
 
-            en_match = re.search(r'Seedance prompt:\s*"([^"]+)"', result, re.IGNORECASE)
+            en_match = re.search(r'Seedance prompt:\s*"([^"]+)"', result_text, re.IGNORECASE)
             if en_match:
                 draft.visual_prompt_en = en_match.group(1)
             else:
-                en_block = re.search(r'(?:Seedance|English)[^:]*[:：]\s*(.+?)(?:\n━━|\n\n|$)', result, re.DOTALL | re.IGNORECASE)
+                en_block = re.search(r'(?:Seedance|English)[^:]*[:：]\s*(.+?)(?:\n━━|\n\n|$)', result_text, re.DOTALL | re.IGNORECASE)
                 if en_block:
                     draft.visual_prompt_en = en_block.group(1).strip().strip('"')
 
-            log.info("视觉 Prompt 生成完成 (%d 字)", len(result))
+            log.info("视觉 Prompt 生成完成 (%d 字)", len(result_text))
         except Exception as e:
             log.error("creative 模块调用失败: %s", e)
             draft.visual_prompt = f"为「{idea.title}」生成视觉素材"
@@ -169,7 +185,7 @@ def create_content(
 
     draft.hashtags = list(set(draft.hashtags))
 
-    # ── 3. 调用火山（即梦/Seedream）生成实际图片；无素材时自动发布也会受影响，故尽量保证调用成功 ──
+    # ── 3. 调用火山生成实际图片 ──
     img_prompt = _best_image_prompt_for_draft(draft)
     if img_prompt:
         try:
@@ -183,6 +199,52 @@ def create_content(
         except Exception as e:
             log.warning("火山图片生成失败（非致命）: %s", e)
 
+    return draft
+
+
+def _create_content_fallback(
+    idea: ContentIdea, brand: str, platforms: list[str],
+    persona: str, target_audience: str, content_goals: str,
+    revision_feedback: str,
+) -> ContentDraft:
+    """AgentLoop 失败时的回退：用简单 chat_completion + JSON mode。"""
+    draft = ContentDraft(idea=idea)
+    extra = []
+    if persona:
+        extra.append(f"人设：{persona}")
+    if target_audience:
+        extra.append(f"受众：{target_audience}")
+    if content_goals:
+        extra.append(f"目标：{content_goals}")
+
+    fallback_system = (
+        "你是自媒体文案专家。为每个平台生成发布文案。输出JSON："
+        '{\"platform_copy\": {\"平台\": {\"title\": \"...\", \"body\": \"...\", \"hashtags\": [\"#...\"]}},'
+        ' \"visual_description\": \"...\"}'
+    )
+    user = (
+        f"创意：{idea.title} / {idea.angle} / 钩子：{idea.hook}\n"
+        f"品牌：{brand or '无'}\n平台：{', '.join(platforms)}\n"
+        + "\n".join(extra)
+        + (f"\n修改反馈：{revision_feedback}" if revision_feedback else "")
+    )
+    try:
+        raw = chat_completion(
+            provider="deepseek", system=fallback_system, user=user,
+            temperature=0.7, response_format={"type": "json_object"},
+        )
+        data = json.loads(raw)
+        for plat, content in data.get("platform_copy", {}).items():
+            if isinstance(content, dict):
+                full_text = f"{content.get('title', '')}\n\n{content.get('body', '')}\n\n{' '.join(content.get('hashtags', []))}"
+                draft.platform_copy[plat] = full_text
+                draft.hashtags.extend(content.get("hashtags", []))
+        draft.text_content = data.get("visual_description", idea.title)
+    except Exception as e:
+        log.error("回退文案生成也失败: %s", e)
+        draft.text_content = f"{idea.title}\n{idea.angle}"
+        for plat in platforms:
+            draft.platform_copy[plat] = f"{idea.title}\n\n{idea.angle}\n\n{idea.hook}"
     return draft
 
 
@@ -220,7 +282,7 @@ def best_image_prompt_from_text(visual_prompt: str, visual_prompt_en: str) -> st
 
 
 def review_quality(draft: ContentDraft) -> ContentDraft:
-    """AI 自评内容质量。"""
+    """AI 自评内容质量（使用 JSON mode 保证输出格式）。"""
     review_input = f"""内容标题：{draft.idea.title}
 切入角度：{draft.idea.angle}
 钩子：{draft.idea.hook}
@@ -228,9 +290,11 @@ def review_quality(draft: ContentDraft) -> ContentDraft:
 视觉方向：{draft.visual_prompt[:300]}"""
 
     try:
-        raw = chat_completion(provider="deepseek", system=QUALITY_SYSTEM, user=review_input, temperature=0.3)
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        data = json.loads(json_match.group() if json_match else raw)
+        raw = chat_completion(
+            provider="deepseek", system=QUALITY_SYSTEM, user=review_input,
+            temperature=0.3, response_format={"type": "json_object"},
+        )
+        data = json.loads(raw)
         draft.quality_score = float(data.get("overall_score", 0.5))
         draft.quality_feedback = data.get("feedback", "")
         log.info("质量评分: %.2f — %s", draft.quality_score, draft.quality_feedback)

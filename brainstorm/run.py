@@ -314,6 +314,10 @@ REFINE_SYSTEM = REFINE_SYSTEM_CAMPAIGN
 
 
 def refine_brainstorm_topic_deepseek(topic: str, context: str, topic_type: str = "campaign") -> str:
+    """用 AgentLoop 优化脑暴主题——LLM 可搜索行业信息、竞品案例来丰富 Insight。"""
+    from core.agent import AgentLoop
+    from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL
+
     user = f"""Input: Raw brainstorming topic and background materials below.
 
 Output: First the INSIGHT LAYER (concise), then the Brainstorm Seed. In the #brainstorm section you must include "原始主题：" and copy the raw topic below verbatim (一字不改). Stay close to the user's topic; do not over-interpret or add objectives they did not imply. All content in Chinese (中文). No asterisks; plain text only.
@@ -325,13 +329,41 @@ Raw topic:
 
 Background materials:
 {context[:8000] if len(context) > 8000 else context}"""
+
     refine_sys = _REFINE_SYSTEMS.get(topic_type, REFINE_SYSTEM_CAMPAIGN)
+    refine_sys += (
+        "\n\n你拥有搜索工具。在生成 Insight Layer 之前，建议先搜索：\n"
+        "1. 相关行业/话题的最新动态（用 web_search 或 news_search）\n"
+        "2. 如果涉及社交平台内容，搜一下平台上相关话题的热度和角度（用 search_platform）\n"
+        "3. 如果需要了解当前热点，用 get_trending\n"
+        "搜索结果可以帮你写出更有洞察力的 Insight Layer，但不要过度搜索——2-3次搜索足够。"
+    )
+
     try:
         from core.skill_router import enrich_prompt
-        sys = enrich_prompt(refine_sys, user_text=user, bot_type="brainstorm")
-        return chat_completion(provider="deepseek", system=sys, user=user).strip()
+        refine_sys = enrich_prompt(refine_sys, user_text=user, bot_type="brainstorm")
     except Exception:
-        return ""
+        pass
+
+    try:
+        agent = AgentLoop(
+            provider="deepseek",
+            system=refine_sys,
+            max_rounds=5,
+            temperature=0.7,
+            on_tool_call=lambda name, args: print(f"  🔍 [主题调研] {name}: {str(args)[:80]}", flush=True),
+        )
+        agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL])
+        result = agent.run(user)
+        if result.tool_calls_made:
+            print(f"  [主题优化] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+        return result.content
+    except Exception as e:
+        print(f"  [主题优化] AgentLoop 失败({e}), 回退简单调用", flush=True)
+        try:
+            return chat_completion(provider="deepseek", system=refine_sys, user=user).strip()
+        except Exception:
+            return ""
 
 
 # ── 角色 & 轮次配置 ─────────────────────────────────────────
@@ -717,11 +749,40 @@ def run_round(
             user += " 最后必须附上完整的 Claude Code Handoff Pack（A 决策与理由、B 行动清单、C 可复制块）。"
 
         provider = get_model_for_role(role)
-        try:
-            raw = chat_completion(provider=provider, system=system, user=user)
-        except Exception as e:
-            print(f"    [{idx}/{n_roles}] {cn_name} LLM 调用失败: {e}", flush=True)
-            raw = "(该角色暂时无法发言)"
+        is_songzi = cn_name == "松子仁" or role == "Synthesizer"
+        use_agent = is_songzi and round_num >= 3
+
+        if use_agent:
+            try:
+                from core.agent import AgentLoop
+                from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, SEARCH_PLATFORM_TOOL
+                tool_system = system + (
+                    "\n\n你拥有搜索工具。作为总成角色做最终裁决时，如果需要数据支撑你的判断"
+                    "（如验证某个方向的市场可行性、查竞品案例、确认技术可行性），可以主动搜索。"
+                    "但不要过度搜索——你的主要职责是基于讨论做出判断，搜索只用于关键决策点。"
+                )
+                agent = AgentLoop(
+                    provider=provider, system=tool_system, max_rounds=4, temperature=0.7,
+                    on_tool_call=lambda name, args: print(f"      🔍 [{cn_name}] {name}: {str(args)[:60]}", flush=True),
+                )
+                agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, SEARCH_PLATFORM_TOOL])
+                result = agent.run(user)
+                raw = result.content
+                if result.tool_calls_made:
+                    print(f"      [{cn_name}] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+            except Exception as e:
+                print(f"    [{idx}/{n_roles}] {cn_name} AgentLoop 失败({e}), 回退简单调用", flush=True)
+                try:
+                    raw = chat_completion(provider=provider, system=system, user=user)
+                except Exception as e2:
+                    print(f"    [{idx}/{n_roles}] {cn_name} LLM 调用失败: {e2}", flush=True)
+                    raw = "(该角色暂时无法发言)"
+        else:
+            try:
+                raw = chat_completion(provider=provider, system=system, user=user)
+            except Exception as e:
+                print(f"    [{idx}/{n_roles}] {cn_name} LLM 调用失败: {e}", flush=True)
+                raw = "(该角色暂时无法发言)"
         raw_display = truncate_for_display(raw)
         display = _format_discussion_for_readability(raw_display)
         messages_this_round.append((role, display))
@@ -919,7 +980,7 @@ def run_brainstorm(
         if topic_type == "campaign":
             print("[最终交付] 由 Kimi 生成讨论总结 + Claude Code prompt、视觉大模型 prompt...", flush=True)
             final_system = (
-                "你是体验创新流程的交付整理员。根据以下四轮讨论摘要，输出两样内容，分开写、标题明确。全文必须使用中文。"
+                "你是体验创新流程的交付整理员。根据以下四轮讨论摘要，输出三样内容，分开写、标题明确。全文必须使用中文。"
                 "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
                 "【交付一】讨论总结 + 供 Claude Code 完善成具体计划和工作流的 prompt\n"
                 "1. 讨论总结：先逐一列出四轮中讨论过的所有创意/方向（第一轮约 10 个、第二轮 6 个、第三轮留下 3 个），"
@@ -930,12 +991,18 @@ def run_brainstorm(
                 "为上述 3 个体验方向各写一份可直接交给图像/视频大模型使用的 prompt。每份须包含："
                 "（1）能够可视化的体验参考——场景、光线、氛围、关键瞬间、人物动作等，语言简洁、适合作生成模型输入；"
                 "须自动加入符合品牌调性的风格描述（如色彩、质感、情绪基调、视觉语言）。"
-                "（2）用户角度的创意脚本——从用户视角可被拍摄/讲述的脚本或梗概，须有传播力（易被转发、可引发共鸣或讨论、具备记忆点）。"
+                "（2）用户角度的创意脚本——从用户视角可被拍摄/讲述的脚本或梗概，须有传播力（易被转发、可引发共鸣或讨论、具备记忆点）。\n\n"
+                "【交付三】需要人来判断的问题\n"
+                "从整个讨论中提炼出 3-5 个需要真人来做判断的关键问题。每个问题写清楚：\n"
+                "- 问谁（决策者/客户/团队成员/领域专家）\n"
+                "- 问什么（一句话说清楚需要判断的问题）\n"
+                "- 为什么这个判断很关键（不解决会卡住什么）\n"
+                "这些应该是AI无法替代的判断——涉及价值观、资源取舍、对人的了解、政治考量等。"
             )
         elif topic_type == "project":
             print("[最终交付] 由 Kimi 生成项目方案总结 + MVP 定义 + Claude Code prompt...", flush=True)
             final_system = (
-                "你是产品/项目脑暴的交付整理员。根据以下四轮讨论摘要，输出两样内容，分开写、标题明确。全文必须使用中文。"
+                "你是产品/项目脑暴的交付整理员。根据以下四轮讨论摘要，输出三样内容，分开写、标题明确。全文必须使用中文。"
                 "可用 **加粗** 标记关键词，可用 - 列要点，段间留空行，提高可读性。\n\n"
                 "【交付一】讨论总结 + MVP 定义\n"
                 "1. 讨论总结：先列出各轮讨论过的所有方向，再概括最终留下的 3 个方向的核心思路。\n"
@@ -945,7 +1012,13 @@ def run_brainstorm(
                 "- 要做什么（功能描述）\n"
                 "- 技术方案建议（语言、框架、架构）\n"
                 "- 第一步从哪开始\n"
-                "- 验收标准（怎么算做完了）"
+                "- 验收标准（怎么算做完了）\n\n"
+                "【交付三】需要人来判断的问题\n"
+                "从整个讨论中提炼出 3-5 个需要真人来做判断的关键问题。每个问题写清楚：\n"
+                "- 问谁（决策者/客户/用户/技术专家）\n"
+                "- 问什么（一句话说清楚需要判断的问题）\n"
+                "- 为什么这个判断很关键（不解决会卡住什么）\n"
+                "这些应该是AI无法替代的判断——涉及优先级取舍、用户真实需求、资源投入、技术可行性等。"
             )
         else:
             print("[最终交付] 由 Kimi 生成行动方案总结...", flush=True)
@@ -960,19 +1033,48 @@ def run_brainstorm(
                 "- 怎么知道有没有效（检验标准，不是感觉）\n"
                 "- 最可能卡住的地方 + 卡住了怎么办\n"
                 "- 时间线建议\n\n"
+                "【交付三】需要人来判断的问题\n"
+                "从讨论中提炼 2-3 个需要你（或相关的人）亲自判断的问题。每个写清楚：\n"
+                "- 问谁（自己/家人/朋友/专业人士）\n"
+                "- 问什么\n"
+                "- 为什么这个判断别人替不了你\n\n"
                 "最后给一个总结建议：如果只能选一个方向先试，选哪个、为什么。"
             )
+        final_system += (
+            "\n\n你拥有搜索工具。在生成交付物时，建议：\n"
+            "1. 对讨论中提到的关键数据、案例、市场判断做 fact-check（用 web_search 搜索验证）\n"
+            "2. 如果涉及竞品或行业趋势，搜索确认最新信息\n"
+            "3. 搜索结果可以融入交付物中，增加可信度\n"
+            "不要过度搜索——3-5次足够，重点验证最关键的事实。"
+        )
         try:
-            final_output = chat_completion(provider="kimi", system=final_system, user=summary_input).strip()
-            session_lines.append("## 最终交付（两样）")
+            from core.agent import AgentLoop
+            from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, FETCH_URL_TOOL
+            agent = AgentLoop(
+                provider="kimi", system=final_system, max_rounds=6, temperature=0.5,
+                on_tool_call=lambda name, args: print(f"  🔍 [交付 fact-check] {name}: {str(args)[:80]}", flush=True),
+            )
+            agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, FETCH_URL_TOOL])
+            result = agent.run(summary_input)
+            final_output = result.content
+            if result.tool_calls_made:
+                print(f"  [最终交付] fact-check 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+        except Exception as e:
+            print(f"  [最终交付] AgentLoop 失败({e}), 回退简单调用", flush=True)
+            try:
+                final_output = chat_completion(provider="kimi", system=final_system, user=summary_input).strip()
+            except Exception as e2:
+                print(f"[最终交付] 生成失败: {e2}", flush=True)
+                final_output = ""
+
+        if final_output:
+            session_lines.append("## 最终交付")
             session_lines.append("")
             session_lines.append(final_output)
             session_lines.append("")
             to_feishu = final_output if len(final_output) <= 8000 else final_output[:8000] + "\n\n[内容过长，完整交付请查看 session 文件]"
             _send_brainstorm_card("最终交付", to_feishu, color="green", webhook_override=resolved_webhook)
             time.sleep(FEISHU_INTERVAL)
-        except Exception as e:
-            print(f"[最终交付] 生成失败: {e}", flush=True)
 
     session_content = "\n".join(session_lines)
     path = save_session(session_content, ts)

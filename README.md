@@ -143,7 +143,11 @@ python3 -m sentiment     # 舆情监控机器人
 1. **Idea Expansion（发散）** → 产出约 10 个体验方向
 2. **Experience Embodiment（具象）** → 压缩为 6 个可执行候选
 3. **Brutal Selection（淘汰）** → 三道筛子，只留 3 个方向
-4. **Execution Conversion（交付）** → 讨论总结 + Claude Code prompt + 视觉 prompt
+4. **Execution Conversion（交付）** → 讨论总结 + Claude Code prompt + 视觉 prompt + 需要人判断的问题
+
+**AgentLoop 增强：** 主题优化阶段自动联网调研行业动态和竞品案例；松子仁（总成角色）在后期轮次可搜索验证方向可行性。
+
+**跨 Bot 联动：** 脑暴完成后引导用户将结论带到自媒体助手（生成内容）、规划（细化方案）、助理bot（记待办）。
 
 **也可 CLI 运行（不需要飞书）：**
 ```bash
@@ -157,7 +161,9 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 - **直接聊** → 像朋友一样讨论，给判断、给方案、指出盲区
 - **发「规划：话题」** → 启动六步结构化深度拆解，完成后可生成飞书文档
 - **发「比稿：话题」** → 启动 Agency 比稿模式（营销专属），多风格方案 PK
-- 涉及市场/行业/旅行/技术时**自动联网搜索**补充真实数据（约 +30s）
+- **AgentLoop 增强**：每步规划中 LLM 可主动搜索市场数据、竞品信息、行业趋势
+- 规划完成后自动生成「**下一步：问对问题**」卡片（需要人判断的 + 可交给 AI 深化的 prompt）
+- **跨 Bot 联动**：完成后引导用户去自媒体助手生成内容、去助理bot创建项目
 
 **五种规划模式：**
 | 模式 | 包含步骤 | 适合场景 |
@@ -200,7 +206,7 @@ python3 -m pitch --topic "618 大促营销方案"
 
 ### 3. 助手机器人 (`assistant/`)
 
-全能工作搭档：备忘+线程、项目管理、财务管理、联网研究、日/周/月报。
+全能工作搭档：备忘+线程、项目管理、财务管理、翻译、联网研究、日/周/月报。普通聊天使用 AgentLoop（可联网搜索、查用户上下文、查团队决策）。
 
 **备忘 + 工作线程：**
 ```
@@ -298,6 +304,14 @@ fact check Threads 增长是 organic 吗  → 事实核查模式
 | 快速模式 | LLM 直接产出创意 + 生成内容 | 1-3 分钟 | 直接发主题 |
 | 深度模式 | 调用脑暴五人团队 + 规划引擎 + 生成内容 | 5-15 分钟 | `深度：主题` |
 
+**AgentLoop 增强：**
+- 创意引擎（idea_engine）在构思时自动搜索热点趋势和竞品案例
+- 内容工厂（content_factory）写文案前先查平台规范、文案框架、团队偏好
+- 质量不达标时自动修改（最多 2 次），仍不达标保留供人工判断
+- 完成后生成「**下一步：问对问题**」（需审批人/受众了解者/发布负责人判断 + AI 优化 prompt）
+
+**团队判断力沉淀：** 设置品牌、人设、受众、内容目标时，自动记录为团队决策，后续所有 bot 可复用。
+
 **内容管理：**
 ```
 草稿                           → 查看所有内容
@@ -373,7 +387,9 @@ python3 -m conductor.cli --detail abc123  # 查看内容详情
 awesome-lark-bots/
 │
 ├── core/                     # 共享核心模块（所有机器人都用）
-│   ├── llm.py                #   大模型调用封装（DeepSeek/豆包/Kimi）
+│   ├── llm.py                #   大模型调用封装（DeepSeek/豆包/Kimi，支持 function calling）
+│   ├── agent.py              #   通用 AgentLoop 运行时（tool-calling 循环，任何 bot 可用）
+│   ├── tools.py              #   LLM 可调用工具库（搜索/热点/品牌/平台/文案框架/团队决策）
 │   ├── feishu_client.py      #   飞书 API（消息、日历、文档、多维表格 Bitable）
 │   ├── feishu_webhook.py     #   飞书群 Webhook 推送
 │   ├── skill_router.py       #   技能路由器（自动注入领域知识到 prompt）
@@ -450,7 +466,7 @@ awesome-lark-bots/
 │   └── push_target.py        #   推送接收人管理
 │
 ├── prompts.json              # 脑暴「坚果五仁」角色配置
-├── skills/                    # 共享技能库（10 个技能，自动路由注入 prompt）
+├── skills/                    # 共享技能库（11 个技能，自动路由注入 prompt）
 │   ├── __init__.py            #   Skill 基类 + 注册表 + 自动发现
 │   ├── __main__.py            #   CLI: python3 -m skills list / test / activate
 │   ├── personal.py            #   个人合作风格（加载 profiles/ 下的用户 profile）
@@ -458,10 +474,11 @@ awesome-lark-bots/
 │   ├── stakeholder.py         #   利益相关方对齐（利益地图、提案包装、阻力预判）
 │   ├── cross_cultural.py      #   跨文化策略（高/低语境、本地化层级）
 │   ├── translation.py         #   双语翻译（中英内容重构，适配 PPT/邮件/Slack 等场景）
+│   ├── team_decisions.py      #   团队判断力沉淀（记录并自动注入团队偏好/决策到 prompt）
 │   ├── brand.py               #   品牌知识（加载 creative/brands/*.yaml，支持别名自动检测）
 │   ├── marketing.py           #   营销方法论（加载 CN-MKT-Skills/）
-│   ├── platforms.py           #   平台运营指南（加载 platform_guides/）
-│   ├── copywriting.py         #   经典文案框架（AIDA、PAS、FAB 等）
+│   ├── platforms.py           #   平台运营指南（加载 platform_guides/，含工具接口）
+│   ├── copywriting.py         #   经典文案框架（AIDA、PAS、FAB 等，含工具接口）
 │   └── cal_skill.py           #   营销日历（节日、大促、季节性主题）
 │
 ├── CN-MKT-Skills/            # 营销技能知识库（规划机器人可参考）
@@ -493,6 +510,43 @@ awesome-lark-bots/
 
 ---
 
+## AgentLoop — LLM 主动调用工具
+
+所有机器人共享一个通用的 **AgentLoop 运行时**（`core/agent.py`），让 LLM 在生成过程中主动调用工具——搜索竞品、查平台规范、了解团队决策——而不是凭空编造信息。
+
+```python
+from core.agent import AgentLoop
+from core.tools import WEB_SEARCH_TOOL, TRENDING_TOOL
+
+agent = AgentLoop(provider="deepseek", system="你是内容策划师", max_rounds=5)
+agent.add_tools([WEB_SEARCH_TOOL, TRENDING_TOOL])
+result = agent.run("帮我找小红书最近的爆款话题")
+```
+
+**内置工具（`core/tools.py`）：**
+
+| 工具 | 说明 | 使用场景 |
+|------|------|---------|
+| `web_search` | 联网搜索（Tavily + DuckDuckGo） | 规划/脑暴/创意需要实时数据 |
+| `news_search` | 新闻搜索 | 行业动态、时事背景 |
+| `fetch_url` | 抓取网页内容 | 深入分析某篇文章 |
+| `get_trending` | 平台热点趋势 | 蹭热度、选题判断 |
+| `search_platform` | 搜索指定平台的相关内容 | 竞品分析、爆款参考 |
+| `get_brand_info` | 查品牌知识 | 文案需要品牌调性 |
+| `get_platform_guide` | 查平台运营规范 | 字数限制、算法规则 |
+| `get_copywriting_framework` | 查文案框架 | 选择 AIDA/PAS/FAB 等 |
+| `get_team_decisions` | 查团队历史决策 | 复用已有偏好和判断 |
+| `get_user_context` | 查用户工作上下文 | 结合待办/项目给建议 |
+
+**使用 AgentLoop 的模块：**
+- **planner/run.py** — 每步规划时可搜索市场数据、竞品信息
+- **brainstorm/run.py** — 主题优化时调研行业动态；松子仁（总成角色）在后期轮次可搜索验证
+- **creative/bot.py** — 生成 prompt 前搜索平台趋势和热门元素
+- **conductor/stages** — 创意引擎搜索热点、内容工厂查平台规范和文案框架
+- **assistant/bot.py** — 普通聊天时可联网搜索、查用户上下文
+
+---
+
 ## 技能系统 (Skills)
 
 所有机器人共享一套**可插拔的技能库**（`skills/`），通过 `core/skill_router.py` 自动路由——bot 只需一行代码即可获得领域知识增强：
@@ -514,6 +568,7 @@ system = enrich_prompt("你是内容助手...", user_text=msg, bot_type="creativ
 | `stakeholder` | 利益相关方对齐：利益地图、提案包装、阻力预判 | planner（多方信号时） |
 | `cross_cultural` | 跨文化策略：高/低语境、本地化层级、平台生态差异 | planner（全球/海外信号时） |
 | `translation` | 双语翻译：中英内容重构，适配 PPT/邮件/Slack/演讲稿等场景 | 关键词触发 |
+| `team_decisions` | 团队判断力沉淀：记录并复用团队在各 bot 做出的偏好和决策 | 所有 bot |
 | `brand` | 品牌视觉风格、调性、场景（从 `creative/brands/` 加载，支持别名自动检测） | creative / conductor |
 | `marketing` | 营销方法论与策略框架（从 `CN-MKT-Skills/` 加载） | planner / conductor |
 | `platform` | 平台运营指南（从 `skills/platform_guides/` 加载） | conductor / planner |
@@ -682,16 +737,15 @@ The project calls LLMs through `core/llm.py` using the OpenAI-compatible API pro
 
 Currently configured with DeepSeek, Doubao, and Kimi as a starting point, but OpenAI, Claude, Qwen, GLM, and others all work.
 
+### AgentLoop — LLM Tool Calling
+
+All bots share a generic **AgentLoop runtime** (`core/agent.py`) that lets LLMs proactively call tools during generation — search competitors, check platform rules, recall team decisions — instead of hallucinating.
+
+Built-in tools (`core/tools.py`): `web_search`, `news_search`, `fetch_url`, `get_trending`, `search_platform`, `get_brand_info`, `get_platform_guide`, `get_copywriting_framework`, `get_team_decisions`, `get_user_context`.
+
 ### Skills System
 
-All bots share a **plug-and-play skill library** (`skills/`), auto-routed via `core/skill_router.py` — one line of code gives any bot domain-knowledge augmentation:
-
-```python
-from core.skill_router import enrich_prompt
-system = enrich_prompt("You are a content assistant...", user_text=msg, bot_type="creative")
-```
-
-The router checks **user message keywords** and **bot type** to decide which skills to load, appending domain knowledge to the system prompt.
+All bots share a **plug-and-play skill library** (`skills/`), auto-routed via `core/skill_router.py`:
 
 | Skill | Description | Auto-activates for |
 |-------|-------------|-------------------|
@@ -700,6 +754,7 @@ The router checks **user message keywords** and **bot type** to decide which ski
 | `stakeholder` | Stakeholder alignment: interest mapping, framing, resistance bypass | planner (multi-party) |
 | `cross_cultural` | Cross-cultural strategy: high/low context, localization, platform diffs | planner (global) |
 | `translation` | Bilingual translation: CN↔EN content rewriting, adapts to PPT/email/Slack/speech | keyword trigger |
+| `team_decisions` | Team judgment memory: records and reuses preferences/decisions across all bots | all bots |
 | `brand` | Brand visual style, tone, scenarios (auto-detects from aliases) | creative / conductor |
 | `marketing` | Marketing methodology & frameworks | planner / conductor |
 | `platform` | Platform operation guides | conductor / planner |
@@ -709,11 +764,6 @@ The router checks **user message keywords** and **bot type** to decide which ski
 > Data-bearing skills keep their content local — only loader code and templates are in the repo.
 
 Add custom skills by dropping a `.py` file in `skills/` — see [`skills/README.md`](skills/README.md).
-
-```bash
-python3 -m skills list                          # list all skills
-python3 -m skills activate "brand promotion"    # see which skills activate
-```
 
 ### Contributing
 

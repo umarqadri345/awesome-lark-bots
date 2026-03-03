@@ -455,6 +455,74 @@ def _handle_team_command(text: str, open_id: str, mid: str) -> bool:
     return False
 
 
+# ── 智能对话（AgentLoop + 工具）────────────────────────────────
+
+_SMART_CHAT_SYSTEM = (
+    "你是「助理bot」，飞书上的全能工作助手。你能记备忘、管项目、查日程，也能回答各种问题。\n\n"
+    "你拥有以下能力：\n"
+    "1. 查用户工作上下文（get_user_context）— 了解用户在做什么项目、有哪些待办、团队最近在忙什么\n"
+    "2. 联网搜索（web_search / news_search）— 需要实时信息时使用\n"
+    "3. 查热点趋势（get_trending）— 了解各平台当前热门话题\n"
+    "4. 查团队决策（get_team_decisions）— 回顾团队之前做过的重要判断\n\n"
+    "使用策略：\n"
+    "- 用户问工作相关的问题（优先级、进展、建议）→ 先用 get_user_context 了解上下文再回答\n"
+    "- 用户问实时信息（新闻、市场、行业动态）→ 用 web_search 或 news_search\n"
+    "- 简单闲聊或常识问题 → 直接回答，不需要工具\n"
+    "- 不要过度搜索，1-3次工具调用足够\n\n"
+    "回复风格：\n"
+    "- 简洁、有用、直接给结论\n"
+    "- 不要先说「好的」「我来帮你」，直接输出内容\n"
+    "- 如果基于用户的待办/项目给出建议，简要说明依据\n"
+    "- 控制在 300 字以内，除非用户要求详细"
+)
+
+
+def _smart_chat(text: str, open_id: str) -> str:
+    """用 AgentLoop + 工具进行智能对话，失败时回退简单 chat。"""
+    try:
+        from core.agent import AgentLoop
+        from core.tools import (
+            WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL,
+            TEAM_DECISIONS_TOOL, make_user_context_tool,
+        )
+        from core.skill_router import enrich_prompt
+
+        system = enrich_prompt(_SMART_CHAT_SYSTEM, user_text=text, bot_type="assistant")
+
+        agent = AgentLoop(
+            provider="deepseek",
+            system=system,
+            max_rounds=5,
+            temperature=0.7,
+            on_tool_call=lambda name, args: _log(f"🔍 [智能对话] {name}: {str(args)[:80]}"),
+        )
+
+        tools = [WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, TEAM_DECISIONS_TOOL]
+        if open_id:
+            tools.append(make_user_context_tool(open_id))
+        agent.add_tools(tools)
+
+        result = agent.run(text)
+        if result.tool_calls_made:
+            _log(f"[智能对话] 调用了 {len(result.tool_calls_made)} 次工具: "
+                 f"{', '.join(tc['name'] for tc in result.tool_calls_made)}")
+        return result.content or "（暂无回复）"
+
+    except Exception as e:
+        _log(f"[智能对话] AgentLoop 失败({e}), 回退简单 chat")
+        try:
+            from core.skill_router import enrich_prompt
+            system_prompt = enrich_prompt(
+                "你是飞书里的备忘与日程助手。主要功能：记备忘、加日历、查日程。"
+                "同时也可以回答一般问题。直接输出结果，不要先说「好的」「我来帮你」。",
+                user_text=text, bot_type="assistant",
+            )
+            return chat(text, system_prompt=system_prompt) or "（暂无回复）"
+        except Exception as chat_err:
+            _log(f"聊天 LLM 异常: {chat_err}")
+            return "（AI 暂时不可用，请稍后再试）"
+
+
 # ── 消息处理 ─────────────────────────────────────────────────
 
 def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -474,8 +542,9 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             save_push_target_open_id(open_id)
         _log(f"message_id={message_id!r} open_id={open_id!r} 文本长度={len(user_text)}")
         if not user_text:
+            _oid = open_id or ""
             threading.Thread(
-                target=lambda: reply_card(message_id, _welcome()),
+                target=lambda: reply_card(message_id, _welcome(_oid)),
                 daemon=True,
             ).start()
             return
@@ -496,15 +565,40 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             _greeting = t.lower().strip()
             if _greeting in ("hi", "hello", "你好", "嗨", "在吗", "在么", "hey"):
                 _log("发送欢迎卡片(打招呼)")
-                r = reply_card(mid, _welcome())
+                r = reply_card(mid, _welcome(user_open_id or ""))
                 if r and r.get("code") != 0:
                     _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
                 return
             if _greeting in ("你可以做什么", "你能做什么", "你能干嘛", "有什么功能", "介绍下自己", "你是谁"):
                 _log("发送欢迎卡片(你能做什么)")
-                r = reply_card(mid, _welcome())
+                r = reply_card(mid, _welcome(user_open_id or ""))
                 if r and r.get("code") != 0:
                     _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
+                return
+
+            # ── 最近动态（跨 Bot 活动汇总）──
+            if _greeting in ("最近动态", "动态", "团队动态", "bot动态"):
+                _log("查询最近动态")
+                try:
+                    from core.events import scan as _scan_events
+                    events = _scan_events(hours=48)
+                    if not events:
+                        reply_card(mid, make_card("最近动态", [{"text": "过去 48 小时没有 bot 活动记录。"}], color="blue"))
+                    else:
+                        lines = [f"**过去 48 小时共 {len(events)} 条动态：**\n"]
+                        for e in events[-20:]:
+                            ts_short = e.get("ts", "")[-14:-6]
+                            bot = e.get("bot", "?")
+                            summary = e.get("summary", "")
+                            topic = (e.get("meta") or {}).get("topic", "")
+                            line = f"[{ts_short}] **{bot}** · {summary}"
+                            if topic and topic not in summary:
+                                line += f"（{topic[:30]}）"
+                            lines.append(line)
+                        reply_card(mid, make_card("最近动态", [{"text": "\n".join(lines)}], color="blue"))
+                except Exception as _e:
+                    _log(f"查询动态失败: {_e}")
+                    reply_message(mid, "查询动态时出错，请稍后再试。")
                 return
 
             # ── 团队指令 ──────────────────────────────────────
@@ -1883,21 +1977,11 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 reply_message(mid, reply_text[:2000])
                 return
 
-            # ── 普通聊天 ──
+            # ── 普通聊天（AgentLoop + 工具）──
             if action == "chat" and reply:
                 reply_text = reply
             else:
-                from core.skill_router import enrich_prompt
-                system_prompt = enrich_prompt(
-                    "你是飞书里的备忘与日程助手。主要功能：记备忘、加日历、查日程。"
-                    "同时也可以回答一般问题。直接输出结果，不要先说「好的」「我来帮你」。",
-                    user_text=text, bot_type="assistant",
-                )
-                try:
-                    reply_text = chat(text, system_prompt=system_prompt) or "（暂无回复）"
-                except Exception as chat_err:
-                    _log(f"聊天 LLM 异常: {chat_err}")
-                    reply_text = "（AI 暂时不可用，请稍后再试）"
+                reply_text = _smart_chat(text, user_open_id or "")
             _log(f"回复用户消息(聊天) 长度={len(reply_text)} 预览={reply_text[:80]!r}...")
             r = reply_message(mid, reply_text[:2000])
             if r and r.get("code") != 0:
@@ -1923,7 +2007,7 @@ def _handle_bot_p2p_chat_entered(data) -> None:
                 open_id = getattr(user_id, "open_id", None)
         if open_id:
             save_push_target_open_id(open_id)
-            send_card_to_user(open_id, _welcome())
+            send_card_to_user(open_id, _welcome(open_id))
     except Exception as e:
         _log(f"发送欢迎卡片异常: {e}")
 
@@ -1934,49 +2018,113 @@ def _handle_message_read(_data) -> None:
 
 # ── 帮助文本 ─────────────────────────────────────────────────
 
-def _welcome() -> dict:
-    return make_card("小助手", [
-        {"text": "直接跟我说你想做什么就行。下面按功能列了常用说法，照着说即可："},
-        {"divider": True},
-        {"text": (
-            "**1️⃣ 备忘**\n"
-            "· 记一条：`备忘 下周交报告 #工作`（多条可换行或分号分隔）\n"
-            "· 完成/删除：`完成 1`、`删掉 交报告`（按序号或内容都行）\n"
-            "· 看列表：发 `线程` 看所有工作线，发 `看板` 导出到飞书表格"
-        )},
-        {"divider": True},
-        {"text": (
-            "**2️⃣ 项目 & 记账**\n"
-            "· 建项目：`创建项目 Q2营销`（会引导设预算，统一管理在多维表格中）\n"
-            "· 记一笔花费：`记账 午餐 35` 或 `记账 午餐 35 #Q2营销`\n"
-            "· 看汇总：`本月花费`、`Q2营销 总览`"
-        )},
-        {"divider": True},
-        {"text": (
-            "**3️⃣ 联网研究**\n"
-            "· 深度调研：`研究 XX 的增长策略`（多来源搜索 + 结构化报告）\n"
-            "· 事实核查：`fact check 某条说法`"
-        )},
-        {"divider": True},
-        {"text": (
-            "**4️⃣ 翻译 & 英文写作**\n"
-            "· 翻译：`翻译 内容`（自动判断方向）\n"
-            "· 写英文：`帮我写英文 要表达的意思`\n"
-            "· 场景适配：`翻译（邮件）内容`"
-        )},
-        {"divider": True},
-        {"text": (
-            "**5️⃣ 日报·周报·月报**\n"
-            "· 每天 08:00 自动发晨报、18:00 发收尾提醒\n"
-            "· 发 `周报` 本周汇总、`月报` 全维度月度总结"
-        )},
-        {"divider": True},
-        {"note": "发「帮助」可看完整指令列表 · 其他话我会当聊天回复"},
-    ], color="turquoise")
+def _welcome(open_id: str = "") -> dict:
+    """动态欢迎卡片：根据用户状态生成个性化的入口引导。"""
+    status_section = _build_status_section(open_id) if open_id else None
+
+    sections = []
+    if status_section:
+        sections.append({"text": status_section})
+        sections.append({"divider": True})
+    sections.append({"text": "直接跟我说你想做什么就行。下面按功能列了常用说法，照着说即可："})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**1️⃣ 备忘**\n"
+        "· 记一条：`备忘 下周交报告 #工作`（多条可换行或分号分隔）\n"
+        "· 完成/删除：`完成 1`、`删掉 交报告`（按序号或内容都行）\n"
+        "· 看列表：发 `线程` 看所有工作线，发 `看板` 导出到飞书表格"
+    )})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**2️⃣ 项目 & 记账**\n"
+        "· 建项目：`创建项目 Q2营销`（会引导设预算，统一管理在多维表格中）\n"
+        "· 记一笔花费：`记账 午餐 35` 或 `记账 午餐 35 #Q2营销`\n"
+        "· 看汇总：`本月花费`、`Q2营销 总览`"
+    )})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**3️⃣ 联网研究**\n"
+        "· 深度调研：`研究 XX 的增长策略`（多来源搜索 + 结构化报告）\n"
+        "· 事实核查：`fact check 某条说法`"
+    )})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**4️⃣ 翻译 & 英文写作**\n"
+        "· 翻译：`翻译 内容`（自动判断方向）\n"
+        "· 写英文：`帮我写英文 要表达的意思`\n"
+        "· 场景适配：`翻译（邮件）内容`"
+    )})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**5️⃣ 日报·周报·月报**\n"
+        "· 每天 08:00 自动发晨报、18:00 发收尾提醒\n"
+        "· 发 `周报` 本周汇总、`月报` 全维度月度总结"
+    )})
+    sections.append({"divider": True})
+    sections.append({"text": (
+        "**6️⃣ 团队协作**\n"
+        "· 创建：`创建团队 名称`（会生成 6 位团队码）\n"
+        "· 加入：`加入团队 ABC123`（输入团队码即可）\n"
+        "· 查看：`我的团队`、`团队码`"
+    )})
+    sections.append({"divider": True})
+    sections.append({"note": "发「帮助」可看完整指令列表 · 其他话我会当聊天回复"})
+    return make_card("助理bot", sections, color="turquoise")
+
+
+def _build_status_section(open_id: str) -> str:
+    """根据用户当前状态生成个性化的快捷入口提示。"""
+    tips = []
+    try:
+        from memo.store import list_memos
+        from memo.projects import list_projects as _list_projects
+        memos = list_memos(limit=50, user_open_id=open_id)
+        pending = [m for m in memos if not m.get("done")]
+        projects = _list_projects()
+
+        if pending:
+            tips.append(f"📝 你有 **{len(pending)}** 条待办，发「备忘」查看")
+        else:
+            tips.append("📝 还没有待办，试试「备忘 你想记的事 #标签」")
+
+        if projects:
+            tips.append(f"📁 {len(projects)} 个项目在管理中，发「项目列表」查看")
+        else:
+            tips.append("📁 还没有项目，试试「创建项目 项目名」")
+    except Exception:
+        pass
+
+    try:
+        from core.events import scan as scan_events
+        recent = scan_events(hours=24)
+        if recent:
+            by_bot: dict[str, list] = {}
+            for e in recent:
+                by_bot.setdefault(e.get("bot", ""), []).append(e)
+            activity_parts = []
+            if "brainstorm" in by_bot:
+                n = len(by_bot["brainstorm"])
+                last_topic = (by_bot["brainstorm"][-1].get("meta") or {}).get("topic", "")[:30]
+                activity_parts.append(f"脑暴 {n} 场" + (f"（最新：{last_topic}）" if last_topic else ""))
+            if "conductor" in by_bot:
+                activity_parts.append(f"内容 {len(by_bot['conductor'])} 条")
+            if "planner" in by_bot:
+                activity_parts.append(f"规划 {len(by_bot['planner'])} 次")
+            if "sentiment" in by_bot:
+                activity_parts.append(f"舆情 {len(by_bot['sentiment'])} 份")
+            if activity_parts:
+                tips.append(f"🔄 最近24h团队动态：{'、'.join(activity_parts)}，发「最近动态」查看详情")
+    except Exception:
+        pass
+
+    if not tips:
+        return ""
+    tips.append("💡 **不知道做什么？** 直接描述你想做的事，比如「帮我想个推广方案」")
+    return "**👋 当前状态：**\n" + "\n".join(f"  {t}" for t in tips)
 
 
 def _help() -> dict:
-    return help_card("小助手", [
+    return help_card("助理bot", [
         ("1️⃣ 备忘",
          "① 记一条：`备忘 内容 #标签`（标签可选，多条用换行或分号分隔）\n"
          "② 标记完成：`完成 1`、`做完了 交报告`、`第三条完成`\n"
@@ -2010,6 +2158,13 @@ def _help() -> dict:
          "② 查日程：`今天`、`明天`\n"
          "③ 自动推送：每天 08:00 晨报、18:00 收尾提醒\n"
          "④ 手动报告：`周报` 本周汇总，`月报` 全维度月度总结"),
+        ("8️⃣ 团队协作",
+         "① `创建团队 名称` — 创建团队，生成 6 位团队码，分享给成员即可加入\n"
+         "② `加入团队 ABC123` — 输入团队码加入\n"
+         "③ `我的团队` — 查看已加入的所有团队\n"
+         "④ `团队码` — 查看当前团队码\n"
+         "⑤ `切换到 团队名` — 切换当前团队\n"
+         "⑥ `离开团队` — 退出当前团队"),
     ], footer="多步流程中发「取消」可退出 · 其他消息当聊天回复")
 
 
