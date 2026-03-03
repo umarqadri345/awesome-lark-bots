@@ -112,7 +112,7 @@ def _welcome() -> dict:
             "策略：用户增长靠补贴还是靠产品本身？",
             "设计一个让猫主动帮你干活的智能家居",
         ],
-        hints=["自动识别：营销/项目/策略探讨/生活", "可用前缀强制指定模式", "多行消息：第一行主题，其余背景", "发「帮助」查看说明"],
+        hints=["自动识别：营销/项目/策略探讨/生活", "可用前缀强制指定模式", "支持粘贴飞书文档/Wiki链接作为背景", "发「帮助」查看说明"],
     )
 
 
@@ -142,6 +142,7 @@ def _help() -> dict:
          "发「**新主题**」开始新一轮脑暴\n"
          "发「**退出**」结束追问"),
         ("多行消息", "第一行 = 主题\n其余行 = 背景材料"),
+        ("飞书文档", "消息中粘贴飞书云文档或 Wiki 链接，系统自动读取内容作为讨论背景。\n长文档会自动用 Kimi 摘要后注入。"),
     ], footer="脑暴过程约 3-5 分钟，完成后可继续追问深入")
 
 
@@ -473,9 +474,23 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             _update_session(user_key, mode="brainstorming", topic=topic,
                 round_summaries=[], final_output="", followup_history=[])
 
+            # ── 检测并拉取飞书文档作为背景材料
+            try:
+                from core.doc_reader import fetch_docs_from_text, summarize_long_doc
+                doc_content, doc_titles = fetch_docs_from_text(text)
+                if doc_content:
+                    doc_content = summarize_long_doc(doc_content, topic)
+                    context = f"{context}\n\n{doc_content}" if context else doc_content
+                    doc_note = f"\n📄 已读取 {len(doc_titles)} 篇文档：{'、'.join(doc_titles)}"
+                else:
+                    doc_note = ""
+            except Exception as e:
+                _log(f"文档读取异常: {e}")
+                doc_note = ""
+
             reply_card(mid, progress_card(
                 "正在启动脑暴",
-                f"**主题：**{topic[:200]}\n\n讨论过程将实时推送到飞书群，完成后我会通知你。",
+                f"**主题：**{topic[:200]}{doc_note}\n\n讨论过程将实时推送到飞书群，完成后我会通知你。",
             ))
             _log(f"启动脑暴: topic={topic[:80]!r}")
             try:

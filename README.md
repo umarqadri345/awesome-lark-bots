@@ -28,8 +28,8 @@
 | 机器人 | 一句话介绍 | 在飞书上怎么用 | 启动命令 |
 |--------|-----------|---------------|----------|
 | **自媒体助手** ⚗️ | 自媒体全流程编排：选题→脑暴→创作→质量自动修正→存储，AgentLoop 加持 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
-| **脑暴机器人** | 5 个 AI 角色 + AgentLoop 联网调研，四轮产出创意 + 需人判断的问题 | 发消息：`咖啡品牌 × 音乐节跨界联动` | `python3 -m brainstorm` |
-| **规划机器人** | 六步规划（每步可联网搜索）+ Agency 比稿 + 飞书文档 + Handoff 卡片 | 发消息：`规划：Q3 策略` / `比稿：618 方案` | `python3 -m planner` |
+| **脑暴机器人** | 5 个 AI 角色 + AgentLoop 联网调研，四种模式 + 飞书文档读取 | 发消息：`策略：增长靠补贴还是产品` / 粘贴飞书链接 | `python3 -m brainstorm` |
+| **规划机器人** | 六步规划（每步可联网搜索）+ Agency 比稿 + 飞书文档读写 + Handoff 卡片 | 发消息：`规划：Q3 策略` / 粘贴飞书链接 | `python3 -m planner` |
 | **助手机器人** | 备忘+线程、项目管理（Bitable）、财务、翻译、智能聊天（AgentLoop） | 发消息：`创建项目 Q2营销` / `翻译 xxx` | `python3 -m assistant` |
 | **素材 Bot** | 生成 AI 工具 prompt + 执行 Brief → 多维表格素材管理 | 发消息：`春日樱花的抖音预告` / `安排制作` | `python3 -m creative` |
 | **舆情监控** | 15 个社媒平台 + Web Search（Tavily/DDG）采集，三阶段补量 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
@@ -128,7 +128,14 @@ python3 -m sentiment     # 舆情监控机器人
 
 ### 1. 脑暴机器人 (`brainstorm/`)
 
-给机器人发消息即可触发 AI 多角色脑暴。
+给机器人发消息即可触发 AI 多角色脑暴。支持四种模式（自动识别，也可用前缀强制指定）：
+
+| 模式 | 前缀 | 适合场景 | 交付侧重 |
+|------|------|---------|---------|
+| 营销活动 | `营销：` / `活动：` | 品牌联动、线下活动、内容策略 | 体验设计、传播节奏、视觉概念 |
+| 创意项目 | `项目：` / `产品：` | 产品设计、游戏设计、side project | 用户体验、技术可行性、MVP 定义 |
+| 策略探讨 | `策略：` / `探讨：` | 开放式战略问题、价值判断、方向选择 | 观点碰撞、洞察深度、决策框架 |
+| 通用探索 | `探索：` / `生活：` | 生活决策、职业规划、个人目标 | 可执行性、个人契合度、行动方案 |
 
 **坚果五仁团队**（5 个 AI 角色，各有分工）：
 
@@ -143,13 +150,17 @@ python3 -m sentiment     # 舆情监控机器人
 **四轮讨论流程：**
 1. **Idea Expansion（发散）** → 产出约 10 个体验方向
 2. **Experience Embodiment（具象）** → 压缩为 6 个可执行候选
-3. **Brutal Selection（淘汰）** → 三道筛子，只留 3 个方向
+3. **Brutal Selection（淘汰）** → 三道筛子，只留 3 个方向（策略模式用洞察深度/可证伪性/行动差异三维筛选）
 4. **Execution Conversion（交付）** → 三板块最终交付物
 
 **最终交付物（三板块，均由 AgentLoop + 联网搜索增强）：**
 1. **去问对的人对的问题** — 3-5 个需真人判断的关键问题，每个含：问谁、拿这句话去问、背景数据、为什么不能跳过
 2. **交给最强 AI 继续深化** — 一段完整的 prompt，可直接复制给 Claude/Opus 生成执行计划+工作流
 3. **视觉概念增强既视感** — 可直接复制给图像/视频模型的 prompt（场景描述 + 用户视角创意脚本）
+
+> 策略模式的第三板块为「思维可视化」——策略地图/决策树 + 未来场景对比，适合交给图像模型做战略可视化。
+
+**飞书文档读取：** 消息中粘贴飞书云文档或 Wiki 链接，系统自动通过 API 拉取内容作为讨论背景。长文档（>15000 字）自动使用 Kimi 128K 做结构化摘要后注入。
 
 **AgentLoop 增强：** 主题优化阶段自动联网调研行业动态和竞品案例；松子仁（总成角色）在后期轮次可搜索验证方向可行性；最终交付搜索数据支撑关键判断。
 
@@ -167,6 +178,7 @@ python3 -m brainstorm.run --topic "咖啡品牌 × 音乐节跨界联动" --cont
 - **直接聊** → 像朋友一样讨论，给判断、给方案、指出盲区
 - **发「规划：话题」** → 启动六步结构化深度拆解，完成后可生成飞书文档
 - **发「比稿：话题」** → 启动 Agency 比稿模式（营销专属），多风格方案 PK
+- **粘贴飞书链接** → 自动拉取云文档/Wiki 内容作为规划背景，长文档自动摘要
 - **AgentLoop 增强**：每步规划中 LLM 可主动搜索市场数据、竞品信息、行业趋势
 - 规划完成后自动生成「**下一步：问对问题**」卡片（需要人判断的 + 可交给 AI 深化的 prompt）
 - **跨 Bot 联动**：完成后引导用户去自媒体助手生成内容、去助理bot创建项目
@@ -396,7 +408,8 @@ awesome-lark-bots/
 │   ├── llm.py                #   大模型调用封装（DeepSeek/豆包/Kimi，支持 function calling）
 │   ├── agent.py              #   通用 AgentLoop 运行时（tool-calling 循环，任何 bot 可用）
 │   ├── tools.py              #   LLM 可调用工具库（搜索/热点/品牌/平台/文案框架/团队决策）
-│   ├── feishu_client.py      #   飞书 API（消息、日历、文档、多维表格 Bitable）
+│   ├── feishu_client.py      #   飞书 API（消息、日历、文档、多维表格 Bitable、Wiki）
+│   ├── doc_reader.py         #   飞书文档读取（检测链接 → 拉取内容 → Kimi 长文摘要）
 │   ├── feishu_webhook.py     #   飞书群 Webhook 推送
 │   ├── skill_router.py       #   技能路由器（自动注入领域知识到 prompt）
 │   └── utils.py              #   工具函数（截断、时间戳、文件保存）
@@ -642,6 +655,8 @@ docker-compose logs -f brainstorm
 - [x] **跨 Bot 联动**：各 bot 完成后引导用户将结果带到其他 bot 继续推进
 - [x] **AgentLoop**：所有核心 bot 支持 LLM 主动调用工具（搜索、查知识、查决策）
 - [x] **团队判断力沉淀**：团队偏好和决策自动记录并注入所有 bot 的 prompt
+- [x] **飞书文档读取**：脑暴/规划支持粘贴飞书云文档或 Wiki 链接，自动拉取内容作为背景，长文档 Kimi 128K 摘要
+- [x] **脑暴四种模式**：营销活动 / 创意项目 / 策略探讨 / 通用探索，支持前缀强制指定
 - [ ] **脑暴**：支持自定义 AI 角色组合、更多大模型接入
 - [ ] **舆情**：更多平台采集器、情感分析准确度提升
 - [ ] **新闻聚合**：更多新闻源、可自定义的关注领域
@@ -697,8 +712,8 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 | Bot | What it does | Command |
 |-----|-------------|---------|
 | **Content Assistant** ⚗️ | End-to-end content pipeline with AgentLoop: topic → brainstorm → create (auto quality revision) → store → handoff prompts | `python3 -m conductor` |
-| **Brainstorm** | 5 AI personas + AgentLoop research, 4-round discussion, outputs "questions for humans" | `python3 -m brainstorm` |
-| **Planner** | 6-step planning (each step can search), Agency Pitch mode, Feishu docs (10 types), handoff cards | `python3 -m planner` |
+| **Brainstorm** | 5 AI personas + AgentLoop research, 4 modes (marketing/project/strategy/explore), Feishu doc reading | `python3 -m brainstorm` |
+| **Planner** | 6-step planning (each step can search), Agency Pitch, Feishu doc read/write (10 types), handoff cards | `python3 -m planner` |
 | **Assistant** | Memos, project management (Bitable), finance, translation (CN↔EN), smart chat (AgentLoop) | `python3 -m assistant` |
 | **Creative Prompt** | Generate AI tool prompts (with trend research) + exec brief → Bitable asset tracker | `python3 -m creative` |
 | **Sentiment Monitor** | 3-phase pipeline: 15 social platforms + Web Search (Tavily/DDG) for ~1000 posts | `python3 -m sentiment` |

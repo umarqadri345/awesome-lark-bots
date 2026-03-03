@@ -66,7 +66,7 @@ def _load_skills_context(topic: str = "") -> str:
 
 def refine_brief(topic: str, context: str) -> str:
     skills = _load_skills_context(topic)
-    user_msg = f"原始需求：\n{topic}\n\n背景材料：\n{context[:8000] if len(context) > 8000 else context}"
+    user_msg = f"原始需求：\n{topic}\n\n背景材料：\n{context[:20000] if len(context) > 20000 else context}"
     if skills:
         user_msg += f"\n\n{skills[:4000]}"
     user_msg += "\n\n请将上述需求结构化为 Planning Brief。保持原始意图，不要过度解读。使用中文。"
@@ -101,7 +101,7 @@ def run_step(step_num: int, topic: str, context: str, previous_outputs: list[tup
 
     parts = [f"规划主题：{topic}"]
     if context:
-        parts.append(f"背景材料：{context[:6000]}")
+        parts.append(f"背景材料：{context[:12000]}")
     for prev_num, prev_name, prev_output in previous_outputs:
         parts.append(f"--- 第 {prev_num} 步 {prev_name} 的输出 ---\n{prev_output}")
     parts.append(instruction)

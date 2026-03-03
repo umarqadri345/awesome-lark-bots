@@ -1366,3 +1366,27 @@ def read_spreadsheet_values(
         return True, values
     except Exception:
         return False, []
+
+
+# ── Wiki 知识库 ─────────────────────────────────────────────
+
+def get_wiki_node_info(node_token: str) -> Tuple[bool, dict]:
+    """通过 wiki node_token 获取节点信息（含 obj_token 和 obj_type）。
+
+    Returns: (ok, {"obj_token": str, "obj_type": str, "title": str} | {"error": str})
+    """
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/wiki/v2/spaces/get_node"
+        resp = requests.get(url, params={"token": node_token}, headers=_headers(token), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, {"error": data.get("msg", "获取 wiki 节点失败") or str(data)}
+        node = (data.get("data") or {}).get("node") or {}
+        return True, {
+            "obj_token": node.get("obj_token", ""),
+            "obj_type": node.get("obj_type", ""),
+            "title": node.get("title", ""),
+        }
+    except Exception as e:
+        return False, {"error": f"获取 wiki 节点异常: {e}"}

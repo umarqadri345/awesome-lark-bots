@@ -109,7 +109,7 @@ def _welcome() -> dict:
             "规划：Q3 用户增长策略",
             "快速模式：下周产品发布计划",
         ],
-        hints=["日常问题直接发，复杂决策加「规划：」前缀", "营销比稿发「比稿：话题」", "发送「帮助」查看完整指南"],
+        hints=["日常问题直接发，复杂决策加「规划：」前缀", "支持粘贴飞书文档/Wiki链接作为背景", "发送「帮助」查看完整指南"],
     )
 
 
@@ -147,6 +147,9 @@ def _help() -> dict:
          "涉及市场、行业、旅行、技术选型时自动搜索\n"
          "搜索结果整合后作为规划背景材料\n"
          "个人决策类话题不触发搜索"),
+        ("📎 飞书文档",
+         "消息中粘贴飞书云文档或 Wiki 链接，系统自动读取内容作为规划背景。\n"
+         "长文档会自动用 Kimi 摘要后注入。"),
         ("🏆 Agency 比稿（营销专属）",
          "做营销方案时，想要多个风格的方案PK？\n"
          "发「比稿：」后跟完整需求（可多行、可含预算/约束/目标）：\n"
@@ -959,9 +962,23 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     ))
                     return
                 _running_sessions[user_key] = topic
+            # ── 检测并拉取飞书文档作为背景材料
+            try:
+                from core.doc_reader import fetch_docs_from_text, summarize_long_doc
+                doc_content, doc_titles = fetch_docs_from_text(text)
+                if doc_content:
+                    doc_content = summarize_long_doc(doc_content, topic)
+                    context = f"{context}\n\n{doc_content}" if context else doc_content
+                    doc_note = f"\n📄 已读取 {len(doc_titles)} 篇文档：{'、'.join(doc_titles)}"
+                else:
+                    doc_note = ""
+            except Exception as e:
+                _log(f"文档读取异常: {e}")
+                doc_note = ""
+
             reply_card(mid, progress_card(
                 "正在启动理性规划",
-                f"**主题：**{topic[:200]}\n**模式：**{mode}\n\n规划过程将实时推送到飞书群，完成后我会通知你。",
+                f"**主题：**{topic[:200]}\n**模式：**{mode}{doc_note}\n\n规划过程将实时推送到飞书群，完成后我会通知你。",
             ))
             _log(f"启动规划: topic={topic[:80]!r} mode={mode}")
             try:
