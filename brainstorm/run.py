@@ -413,7 +413,7 @@ Raw topic:
 {topic}
 
 Background materials:
-{context[:20000] if len(context) > 20000 else context}"""
+{context[:30000] if len(context) > 30000 else context}"""
 
     refine_sys = _REFINE_SYSTEMS.get(topic_type, REFINE_SYSTEM_CAMPAIGN)
     refine_sys += (
