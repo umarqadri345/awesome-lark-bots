@@ -1978,10 +1978,7 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # ── 普通聊天（AgentLoop + 工具）──
-            if action == "chat" and reply:
-                reply_text = reply
-            else:
-                reply_text = _smart_chat(text, user_open_id or "")
+            reply_text = _smart_chat(text, user_open_id or "")
             _log(f"回复用户消息(聊天) 长度={len(reply_text)} 预览={reply_text[:80]!r}...")
             r = reply_message(mid, reply_text[:2000])
             if r and r.get("code") != 0:

@@ -27,18 +27,19 @@
 
 | 机器人 | 一句话介绍 | 在飞书上怎么用 | 启动命令 |
 |--------|-----------|---------------|----------|
-| **自媒体助手** ⚗️ | 自媒体全流程编排：输入主题 → 自动脑暴+规划+创作+存储+定时发布 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
-| **脑暴机器人** | 5 个 AI 角色模拟真人团队讨论，四轮产出创意方案 | 发消息：`咖啡品牌 × 音乐节跨界联动` | `python3 -m brainstorm` |
-| **规划机器人** | 六步结构化决策 + 自动联网搜索 + 飞书文档/表格（10 种文档类型） | 发消息：`规划：Q3 用户增长策略` | `python3 -m planner` |
-| **助手机器人** | 备忘+线程、项目管理（飞书表格）、财务（记账/预算/目标）、联网研究、日/周/月报 | 发消息：`创建项目 Q2营销` / `记账 午餐 35` | `python3 -m assistant` |
-| **创意 Prompt** | 生成 Seedance / Nano Banana 等 AI 工具可用的素材 prompt | 发消息：`春日樱花的抖音预告` | `python3 -m creative` |
+| **自媒体助手** ⚗️ | 自媒体全流程编排：选题→脑暴→创作→质量自动修正→存储，AgentLoop 加持 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
+| **脑暴机器人** | 5 个 AI 角色 + AgentLoop 联网调研，四轮产出创意 + 需人判断的问题 | 发消息：`咖啡品牌 × 音乐节跨界联动` | `python3 -m brainstorm` |
+| **规划机器人** | 六步规划（每步可联网搜索）+ Agency 比稿 + 飞书文档 + Handoff 卡片 | 发消息：`规划：Q3 策略` / `比稿：618 方案` | `python3 -m planner` |
+| **助手机器人** | 备忘+线程、项目管理（Bitable）、财务、翻译、智能聊天（AgentLoop） | 发消息：`创建项目 Q2营销` / `翻译 xxx` | `python3 -m assistant` |
+| **素材 Bot** | 生成 AI 工具 prompt + 执行 Brief → 多维表格素材管理 | 发消息：`春日樱花的抖音预告` / `安排制作` | `python3 -m creative` |
 | **舆情监控** | 15 个社媒平台 + Web Search（Tavily/DDG）采集，三阶段补量 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
 | **早知天下事** | 多源新闻聚合 + AI 分析，每日推送新闻简报 | 发消息：`新闻` / `科技新闻` | `python3 -m newsbot` |
 
 > ⚗️ **自媒体助手**目前处于探索阶段——基本框架已搭好，能跑通"选题→脑暴→规划→创作→存储"全流程，但在内容自动生成的质量把控和自媒体平台自动发布方面，还有很多需要探索和优化的空间。我们非常欢迎社区一起来完善这个模块。
 
-七个机器人**共享底层模块**（LLM 调用、飞书 API），各自独立运行、互不干扰。
+七个机器人**共享底层模块**（LLM 调用、飞书 API、AgentLoop、技能系统、团队决策），各自独立运行、互不干扰。
 **自媒体助手是总编排者**——它会自动调用脑暴、规划、创意 Prompt 等模块完成完整的内容生产流程。
+**跨 Bot 联动**——每个 bot 完成任务后会引导你把结果带到其他 bot（如脑暴结论→规划细化→助理记待办），并生成「下一步：问对问题」卡片（需要人判断的 + 可交给 AI 的 prompt）。
 
 ---
 
@@ -626,22 +627,25 @@ docker-compose logs -f brainstorm
 以下是我们正在探索和希望社区一起推进的方向：
 
 ### 自媒体助手（conductor）— 核心探索方向
-- [ ] **内容质量自动评估**：AI 生成的内容如何自动判断"够不够好"，避免发出低质量内容
+- [x] **内容质量自动评估 + 自动修正**：质量不达标自动修改（最多 2 次），仍不达标保留供人工判断
+- [x] **多平台内容适配**：AgentLoop 写文案前自动查平台规范、文案框架，适配各平台调性
+- [x] **人机协作流程**：完成后生成 Handoff 卡片（需要人判断的 + 可交给 AI 的 prompt）
 - [ ] **自媒体平台自动发布**：更稳定的方式把内容发布到小红书、抖音、微博等平台
-- [ ] **多平台内容适配**：同一个创意，自动适配不同平台的格式、风格和字数要求
 - [ ] **数据驱动选题**：根据历史数据表现反馈，优化未来的内容选题方向
-- [ ] **人机协作流程**：在关键节点（如选题确认、发布前审核）加入人工介入机制
 
 ### 各模块改进
+- [x] **跨 Bot 联动**：各 bot 完成后引导用户将结果带到其他 bot 继续推进
+- [x] **AgentLoop**：所有核心 bot 支持 LLM 主动调用工具（搜索、查知识、查决策）
+- [x] **团队判断力沉淀**：团队偏好和决策自动记录并注入所有 bot 的 prompt
 - [ ] **脑暴**：支持自定义 AI 角色组合、更多大模型接入
 - [ ] **舆情**：更多平台采集器、情感分析准确度提升
 - [ ] **新闻聚合**：更多新闻源、可自定义的关注领域
 - [ ] **创意 Prompt**：支持更多 AI 生成工具（MidJourney、Sora 等）的 prompt 格式
 
 ### 基础设施
+- [x] **错误处理和重试机制**：LLM 调用指数退避重试、Feishu API 健壮错误处理、AgentLoop 失败自动回退
 - [ ] 单元测试覆盖核心模块
 - [ ] 多语言支持（英文等）
-- [ ] 更完善的错误处理和重试机制
 - [ ] Web 管理面板（查看运行状态、管理内容）
 
 欢迎在 [Issues](../../issues) 中讨论任何想法，或直接提 PR。
@@ -687,11 +691,11 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 
 | Bot | What it does | Command |
 |-----|-------------|---------|
-| **Content Assistant** ⚗️ | End-to-end content pipeline: topic → brainstorm → plan → create → store → publish | `python3 -m conductor` |
-| **Brainstorm** | 5 AI personas simulate a real team discussion in 4 rounds | `python3 -m brainstorm` |
-| **Planner** | 6-step decisions + auto web research + Feishu docs/sheets (10 types) + Agency Pitch mode (parallel proposals → cross-critique → verdict) | `python3 -m planner` |
-| **Assistant** | Memos + threads, project management (Feishu Bitable), finance tracking, bilingual translation (CN↔EN), web research, daily/weekly/monthly reports | `python3 -m assistant` |
-| **Creative Prompt** | Generate prompts for AI tools + exec brief mode with Bitable asset tracker | `python3 -m creative` |
+| **Content Assistant** ⚗️ | End-to-end content pipeline with AgentLoop: topic → brainstorm → create (auto quality revision) → store → handoff prompts | `python3 -m conductor` |
+| **Brainstorm** | 5 AI personas + AgentLoop research, 4-round discussion, outputs "questions for humans" | `python3 -m brainstorm` |
+| **Planner** | 6-step planning (each step can search), Agency Pitch mode, Feishu docs (10 types), handoff cards | `python3 -m planner` |
+| **Assistant** | Memos, project management (Bitable), finance, translation (CN↔EN), smart chat (AgentLoop) | `python3 -m assistant` |
+| **Creative Prompt** | Generate AI tool prompts (with trend research) + exec brief → Bitable asset tracker | `python3 -m creative` |
 | **Sentiment Monitor** | 3-phase pipeline: 15 social platforms + Web Search (Tavily/DDG) for ~1000 posts | `python3 -m sentiment` |
 | **News Digest** | Multi-source news aggregation + AI analysis, daily push | `python3 -m newsbot` |
 
