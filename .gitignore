@@ -9,6 +9,9 @@
 # 内部资料 —— 不公开
 # ═══════════════════════════════════════════════════════════
 CN-MKT-Skills/
+cn_mkt_data/
+cn_mkt_tool/
+cn_mkt_tool.zip
 creative/brands/*
 !creative/brands/_template.yaml
 skills/platform_guides/*

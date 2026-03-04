@@ -84,28 +84,57 @@ def _send_brainstorm_card(title: str, content: str, color: str = "blue", webhook
 
 REFINE_SYSTEM_CAMPAIGN = """You are a Creative Strategy Architect.
 
-Your task is to clarify and structure the user's raw topic into a Brainstorm Seed. Stay close to the user's original topic: do not over-interpret, over-expand, or replace it with a different brief. Preserve the core intent and wording; only add structure and clarity. Do not add assumptions or objectives the user did not imply.
+Your task has TWO phases. You MUST complete Phase 1 before Phase 2.
 
-Extract USER INSIGHTS and PROJECT INSIGHTS only from what the topic and materials actually imply. Keep insights concise.
+== PHASE 1: PREMISE DECOMPOSITION (命题拆解) ==
 
-You must output in the following structure:
+Before structuring anything, decompose the user's raw topic:
+
+1. Extract Explicit Elements — only what's stated:
+   Time / Place / Format / Brand / Audience / Budget / Scale (skip what's not mentioned)
+
+2. Surface Implicit Assumptions — what the user knows but didn't say:
+   - What does the [time + place + format] combination imply about competitive context?
+   - What does the user's specific word choice reveal about their real concern?
+   - What constraints or opportunities are hiding behind the surface question?
+
+3. Reframe The Real Question — what the user actually needs to solve:
+   (Often very different from the literal question. "用什么主题" might mean "如何在同期品牌混战中一眼不同". "怎么做快闪" might mean "如何在有限预算下做出超越同期竞品的体验")
+
+CRITICAL: Use search tools to validate your assumptions BEFORE moving to Phase 2.
+- Search [time + place + format] to understand competitive landscape (who else, what else, how crowded)
+- Search [brand + past similar activities] to see what's been done and what worked
+- Verify any implicit context you identified (is your assumption about the competitive environment correct?)
+
+== PHASE 2: STRUCTURED OUTPUT ==
+
+Only after Phase 1, output the following structure:
+
+---
+
+PREMISE DECOMPOSITION
+
+显性要素：
+(list what the topic explicitly states, one line each)
+
+隐性假设：
+(2-3 assumptions you surfaced, with evidence from search)
+
+真正的问题：
+(one sentence reframing what the user actually needs to solve)
 
 ---
 
 INSIGHT LAYER
 
 User Insight:
-(concise; only what the topic/materials support)
+(concise; informed by decomposition — what is the user really trying to achieve?)
 
 Project Insight:
 (nature of project, constraints, behavioral success; concise)
 
 Campaign Context Insight:
-(how participants encounter it, defining moment, after; concise)
-
----
-
-Then generate the Brainstorm Seed:
+(competitive landscape, timing, what makes this specific context unique; informed by search)
 
 ---
 
@@ -115,19 +144,19 @@ Then generate the Brainstorm Seed:
 (Copy the user's raw topic verbatim, character for character. Do not paraphrase or rewrite.)
 
 Theme:
-(reframe only slightly; stay aligned with original topic)
+(reframe based on "真正的问题" — stay aligned with user intent but sharpen the focus)
 
 Background:
-(brief, from materials)
+(brief, from materials + search findings about competitive context)
 
 Core Challenge:
-(the real difficulty implied by the topic)
+(the real difficulty — from Premise Decomposition, not surface reading of the topic)
 
 Constraints:
-(realistic; from topic/materials)
+(realistic; from topic/materials + discovered context)
 
 Core Goal:
-(one clear experiential goal; do not broaden scope)
+(one clear experiential goal addressing the real question; do not broaden scope)
 
 Campaign Role:
 offline experiential core / online propagation trigger / hybrid campaign anchor
@@ -148,29 +177,52 @@ Participant【behavior】
 
 Requirements:
 
-Total length: under 500 words. Insights and theme must not expand beyond what the raw topic implies.
+Total length: under 600 words. Premise Decomposition must be concise but specific — no filler.
 
 All output must be in Chinese (中文).
 
 Do not use asterisks (* or **). Plain text only.
 
-Do not over-interpret: if the topic is narrow, keep the seed narrow. If the topic does not specify something, do not invent it.
+Do not over-interpret content the user didn't imply. But DO surface implicit assumptions — the user often knows more context than they explicitly state, and the decomposition must capture that.
 
 Only output the structured content; do not explain your reasoning."""
 
 
 REFINE_SYSTEM_PROJECT = """You are a Creative Strategy Architect for product and project brainstorming.
 
-Your task is to clarify and structure the user's raw topic into a Brainstorm Seed. Stay close to the user's original topic: do not over-interpret, over-expand, or replace it with a different brief.
+Your task has TWO phases. Complete Phase 1 before Phase 2.
 
-You must output in the following structure:
+== PHASE 1: PREMISE DECOMPOSITION ==
+
+Briefly decompose the user's topic:
+
+1. What exists today vs. what's being proposed — is there a gap or is this greenfield?
+2. Who is the real user and what's their current pain point or unmet need?
+3. What implicit technical, resource, or market constraints are hiding in the description?
+
+Use search tools to validate: search for similar products/projects, check if the idea already exists, understand the competitive landscape.
+
+== PHASE 2: STRUCTURED OUTPUT ==
+
+---
+
+PREMISE DECOMPOSITION
+
+现状 vs 提议：
+(what exists today, what gap the project fills)
+
+隐含约束：
+(1-2 constraints discovered through analysis + search)
+
+真正的问题：
+(one sentence reframing what needs to be solved)
 
 ---
 
 INSIGHT LAYER
 
 User Insight:
-(what the creator wants to achieve or explore; concise)
+(what the creator wants to achieve or explore; informed by decomposition)
 
 Project Insight:
 (nature of project, current stage, technical/resource constraints; concise)
@@ -183,16 +235,16 @@ Project Insight:
 (Copy the user's raw topic verbatim, character for character.)
 
 Theme:
-(reframe only slightly; stay aligned with original topic)
+(reframe based on "真正的问题"; stay aligned with original topic)
 
 Background:
-(brief, from materials)
+(brief, from materials + search findings)
 
 Core Challenge:
-(the real difficulty implied by the topic)
+(the real difficulty — from decomposition, not surface reading)
 
 Constraints:
-(realistic; from topic/materials)
+(realistic; from topic/materials + discovered context)
 
 Core Goal:
 (one clear goal for this project; do not broaden scope)
@@ -215,8 +267,8 @@ User【then does what as a result】
 
 Requirements:
 
-Total length: under 500 words. All output in Chinese (中文). Plain text only, no asterisks.
-Do not over-interpret. Only output the structured content; do not explain your reasoning."""
+Total length: under 550 words. All output in Chinese (中文). Plain text only, no asterisks.
+Surface implicit assumptions, but do not over-interpret. Only output the structured content; do not explain your reasoning."""
 
 
 REFINE_SYSTEM_EXPLORE = """You are a Creative Strategy Architect for life and personal brainstorming.
@@ -406,7 +458,9 @@ def refine_brainstorm_topic_deepseek(topic: str, context: str, topic_type: str =
 
     user = f"""Input: Raw brainstorming topic and background materials below.
 
-Output: First the INSIGHT LAYER (concise), then the Brainstorm Seed. In the #brainstorm section you must include "原始主题：" and copy the raw topic below verbatim (一字不改). Stay close to the user's topic; do not over-interpret or add objectives they did not imply. All content in Chinese (中文). No asterisks; plain text only.
+Output: First complete PREMISE DECOMPOSITION (命题拆解), then the INSIGHT LAYER, then the Brainstorm Seed. In the #brainstorm section you must include "原始主题：" and copy the raw topic below verbatim (一字不改). All content in Chinese (中文). No asterisks; plain text only.
+
+IMPORTANT: Before writing anything, use search tools to decompose the premise — understand the competitive context, validate implicit assumptions, and reframe the real question.
 
 ---
 
@@ -418,11 +472,12 @@ Background materials:
 
     refine_sys = _REFINE_SYSTEMS.get(topic_type, REFINE_SYSTEM_CAMPAIGN)
     refine_sys += (
-        "\n\n你拥有搜索工具。在生成 Insight Layer 之前，建议先搜索：\n"
-        "1. 相关行业/话题的最新动态（用 web_search 或 news_search）\n"
-        "2. 如果涉及社交平台内容，搜一下平台上相关话题的热度和角度（用 search_platform）\n"
-        "3. 如果需要了解当前热点，用 get_trending\n"
-        "搜索结果可以帮你写出更有洞察力的 Insight Layer，但不要过度搜索——2-3次搜索足够。"
+        "\n\n你拥有搜索工具。在命题拆解阶段必须搜索来验证你的判断：\n"
+        "1. 场景情报：搜索命题中提到的 [时间+地点+形式] 或 [领域+类型] 组合，了解竞争态势和行业背景（用 web_search 或 news_search）\n"
+        "2. 品牌/项目历史：搜索相关品牌或领域做过的类似事情，看什么有效什么没效\n"
+        "3. 隐含语境验证：基于你发现的隐性假设，搜索确认是否属实\n"
+        "4. 如果涉及社交平台，用 search_platform 看看相关话题热度和角度\n"
+        "3-4 次搜索足够，重点放在验证隐性假设上——这决定了脑暴的方向是否正确。"
     )
 
     try:

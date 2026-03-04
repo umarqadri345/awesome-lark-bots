@@ -83,13 +83,15 @@ class MarketingSkill(Skill):
     name = "marketing"
     description = "CN 营销知识库 — 22 个模块覆盖品牌、受众、平台、活动、预算、发行、跨境协作等"
     trigger_keywords = [
-        "营销", "推广", "marketing", "获客", "增长", "用户获取",
-        "campaign", "赛季活动", "预算", "budget",
-        "发行", "publishing", "社区运营", "community",
-        "跨境", "cross-border", "跨文化",
+        "营销", "推广", "marketing", "策略", "获客", "运营", "增长",
+        "活动", "campaign", "赛季", "预算", "budget",
+        "发行", "publishing", "社区", "community",
+        "跨境", "cross-border", "hq",
         "合规", "compliance", "版号",
-        "竞品", "kol", "投放", "素材制作",
-        "光遇", "sky", "tgc", "thatgamecompany",
+        "光遇", "sky", "tgc", "thatgamecompany", "陈星汉",
+        "品牌", "brand", "竞品", "competitor",
+        "文案", "copywriting", "素材",
+        "kol", "投放", "二创", "ugc",
     ]
     bot_types = []
 
@@ -97,14 +99,14 @@ class MarketingSkill(Skill):
         self.modules_dir = modules_dir or MODULES_DIR
 
     def should_activate(self, user_text: str, bot_type: str = "", **kwargs) -> bool:
-        """纯关键词激活：用户消息必须命中 trigger_keywords 或 Sky 关键词。"""
         if not self.modules_dir.exists():
             return False
         lower = user_text.lower()
         if any(kw.lower() in lower for kw in self.trigger_keywords):
             return True
-        if any(kw.lower() in lower for kw in _SKY_KEYWORDS):
-            return True
+        for kws in _MODULE_KEYWORDS.values():
+            if any(kw.lower() in lower for kw in kws):
+                return True
         return False
 
     def list_modules(self) -> list[dict]:

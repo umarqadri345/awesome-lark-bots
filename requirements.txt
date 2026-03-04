@@ -25,3 +25,8 @@ lxml>=5.0.0
 # conductor
 volcengine-python-sdk[ark]>=5.0.0   # Seedance 视频 + Seedream 图片生成
 # playwright>=1.40.0                # 取消注释启用自动发布（使用系统 Chrome，无需 playwright install）
+
+# cn_mkt_data
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.0

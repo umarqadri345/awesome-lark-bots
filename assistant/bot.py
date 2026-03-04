@@ -797,6 +797,21 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
             _done_prefix = r"(完成|done|搞定|✅|做完了|标记完成|已完成|办好了|弄好了)"
 
+            # 批量完成：「完成 1、2、3」「完成 1,2,3,4,5」「完成 1 2 3」（允许末尾逗号）
+            m_done_batch = re.match(
+                rf"^{_done_prefix}\s*((?:\d+[\s,，、]*)+)\s*$", t, re.IGNORECASE
+            )
+            if m_done_batch and len(re.findall(r"\d+", m_done_batch.group(2))) >= 2:
+                raw_nums = m_done_batch.group(2)
+                indices = sorted(set(int(x) for x in re.findall(r"\d+", raw_nums)), reverse=True)
+                results = []
+                for idx in indices:
+                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                    results.append(msg_text)
+                results.reverse()
+                reply_message(mid, "\n".join(results))
+                return
+
             m_done = re.match(
                 rf"^{_done_prefix}\s*第?\s*(\d+)\s*条?\s*$", t, re.IGNORECASE
             )
@@ -975,24 +990,22 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
             if action == "list_memos":
                 thread_filter = params.get("thread", "")
-                inc_done = params.get("include_done", False)
                 memos = store_list_memos(
-                    limit=15, user_open_id=user_open_id,
-                    thread=thread_filter or None, include_done=inc_done,
+                    limit=50, user_open_id=user_open_id,
+                    thread=thread_filter or None, include_done=False,
                 )
                 if not memos:
-                    reply_card(mid, action_card("📋 暂无备忘", hints=["发「备忘 内容」开始记"], color="blue"))
+                    reply_card(mid, action_card("📋 暂无未完成的备忘", hints=["发「备忘 内容」开始记"], color="blue"))
                     return
                 lines = []
                 for i, m in enumerate(memos, 1):
                     thread = m.get("thread") or ""
                     tag = f"[#{thread}] " if thread else ""
-                    done = "✅ " if m.get("done") else ""
-                    lines.append(f"{i}. {done}{tag}{m.get('content', '')}")
+                    lines.append(f"{i}. {tag}{m.get('content', '')}")
                 reply_card(mid, action_card(
-                    f"📋 备忘列表（{len(memos)} 条）",
+                    f"📋 待办列表（{len(memos)} 条未完成）",
                     "\n".join(lines)[:2000],
-                    hints=["「完成 3」标记完成", "「完成 买牛奶」按内容完成", "「清除备忘 3」彻底删除"],
+                    hints=["「完成 3」或「完成 1,2,3」批量完成", "「删除 3」删除", "「线程」看工作线"],
                     color="blue",
                 ))
                 return
@@ -2142,9 +2155,9 @@ def _help() -> dict:
     return help_card("助理bot", [
         ("1️⃣ 备忘",
          "① 记一条：`备忘 内容 #标签`（标签可选，多条用换行或分号分隔）\n"
-         "② 标记完成：`完成 1`、`做完了 交报告`、`第三条完成`\n"
+         "② 标记完成：`完成 1`、`完成 1,2,3,4,5` 批量完成、`做完了 交报告`\n"
          "③ 删除：`删除 1`、`删掉 交报告`（按序号或内容）\n"
-         "④ 查看：`备忘列表` 看未完成，`线程` 看所有工作线"),
+         "④ 查看：`备忘列表` 看全部待办和已完成，`线程` 看工作线"),
         ("2️⃣ 看板",
          "① `看板` — 导出所有线程到飞书表格\n"
          "② `看板 #标签` — 只导出指定线程\n"
