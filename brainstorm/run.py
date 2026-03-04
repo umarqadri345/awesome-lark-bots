@@ -82,75 +82,40 @@ def _send_brainstorm_card(title: str, content: str, color: str = "blue", webhook
     return _send_card(title, content, webhook, secret=secret, color=color)
 
 
-REFINE_SYSTEM_CAMPAIGN = """You are a Creative Strategy Architect.
+REFINE_SYSTEM_CAMPAIGN = """You are a Creative Strategy Architect. Generate a Brainstorm Seed from the user's topic.
 
-Your task has TWO phases. You MUST complete Phase 1 before Phase 2.
+If a "命题拆解" (Premise Decomposition) is provided in the input, your Brainstorm Seed MUST be informed by its findings — especially "真正的问题" and "隐性假设". Do NOT ignore the decomposition.
 
-== PHASE 1: PREMISE DECOMPOSITION (命题拆解) ==
-
-Before structuring anything, decompose the user's raw topic:
-
-1. Extract Explicit Elements — only what's stated:
-   Time / Place / Format / Brand / Audience / Budget / Scale (skip what's not mentioned)
-
-2. Surface Implicit Assumptions — what the user knows but didn't say:
-   - What does the [time + place + format] combination imply about competitive context?
-   - What does the user's specific word choice reveal about their real concern?
-   - What constraints or opportunities are hiding behind the surface question?
-
-3. Reframe The Real Question — what the user actually needs to solve:
-   (Often very different from the literal question. "用什么主题" might mean "如何在同期品牌混战中一眼不同". "怎么做快闪" might mean "如何在有限预算下做出超越同期竞品的体验")
-
-CRITICAL: Use search tools to validate your assumptions BEFORE moving to Phase 2.
-- Search [time + place + format] to understand competitive landscape (who else, what else, how crowded)
-- Search [brand + past similar activities] to see what's been done and what worked
-- Verify any implicit context you identified (is your assumption about the competitive environment correct?)
-
-== PHASE 2: STRUCTURED OUTPUT ==
-
-Only after Phase 1, output the following structure:
-
----
-
-PREMISE DECOMPOSITION
-
-显性要素：
-(list what the topic explicitly states, one line each)
-
-隐性假设：
-(2-3 assumptions you surfaced, with evidence from search)
-
-真正的问题：
-(one sentence reframing what the user actually needs to solve)
+CRITICAL FORMAT RULE: Your response must start DIRECTLY with "---". No preamble, no introduction, no "基于搜索结果" or "我来生成", no narration. The very first characters you output must be "---".
 
 ---
 
 INSIGHT LAYER
 
 User Insight:
-(concise; informed by decomposition — what is the user really trying to achieve?)
+(what the user really wants — informed by decomposition; concise)
 
 Project Insight:
-(nature of project, constraints, behavioral success; concise)
+(nature of project, constraints, success criteria; concise)
 
 Campaign Context Insight:
-(competitive landscape, timing, what makes this specific context unique; informed by search)
+(competitive landscape, timing, what makes this context unique; from decomposition)
 
 ---
 
 #brainstorm
 
 原始主题：
-(Copy the user's raw topic verbatim, character for character. Do not paraphrase or rewrite.)
+(COPY the raw topic from the input EXACTLY — character for character, punctuation for punctuation. Do NOT paraphrase, abbreviate, add constraints, or change any wording.)
 
 Theme:
-(reframe based on "真正的问题" — stay aligned with user intent but sharpen the focus)
+(reframe based on "真正的问题"; sharpen the focus)
 
 Background:
-(brief, from materials + search findings about competitive context)
+(brief, from materials + decomposition findings about competitive context)
 
 Core Challenge:
-(the real difficulty — from Premise Decomposition, not surface reading of the topic)
+(the real difficulty — from decomposition, not surface reading)
 
 Constraints:
 (realistic; from topic/materials + discovered context)
@@ -176,16 +141,9 @@ Participant【behavior】
 ---
 
 Requirements:
-
-Total length: under 600 words. Premise Decomposition must be concise but specific — no filler.
-
-All output must be in Chinese (中文).
-
-Do not use asterisks (* or **). Plain text only.
-
-Do not over-interpret content the user didn't imply. But DO surface implicit assumptions — the user often knows more context than they explicitly state, and the decomposition must capture that.
-
-Only output the structured content; do not explain your reasoning."""
+- Under 500 words. All Chinese. No asterisks. Plain text only.
+- 原始主题 MUST be an exact verbatim copy. Any deviation is a critical failure.
+- Start with "---". No preamble whatsoever."""
 
 
 REFINE_SYSTEM_PROJECT = """You are a Creative Strategy Architect for product and project brainstorming.
@@ -449,20 +407,117 @@ _REFINE_SYSTEMS = {
 
 REFINE_SYSTEM = REFINE_SYSTEM_CAMPAIGN
 
+# ── 命题拆解（Phase 1）────────────────────────────────────────
+# 独立步骤：搜索验证隐性假设，重新定义真正的问题。
+# 结果会注入到 Brainstorm Seed 生成和后续讨论上下文中。
 
-def refine_brainstorm_topic_deepseek(topic: str, context: str, topic_type: str = "campaign") -> str:
-    """用 AgentLoop 优化脑暴主题——LLM 可搜索行业信息、竞品案例来丰富 Insight。"""
+_DECOMPOSE_SYSTEM = """你是命题拆解专家。用户给了一个脑暴命题，你需要搜索验证后输出三层内容。
+
+显性要素：
+（从命题中提取：时间、地点、品牌、形式、受众、预算、规模。只列用户明确说了的，没提到的不要编造。）
+
+隐性假设：
+（用户没说但暗含的背景。必须基于搜索结果来验证，不要凭空猜测。重点关注：
+- 竞争环境：同时间同地点有哪些竞品/同类活动？场地的特征是什么？
+- 行业语境：这个领域最近的趋势、已被做烂的套路是什么？
+- 用户真正的焦虑：用户的措辞暗示了什么担忧或期望？）
+
+真正的问题：
+（一句话重新定义用户实际需要解决的问题。通常和字面问题不同。）
+
+要求：
+- 必须先搜索再写，不要空想
+- 全部中文
+- 每层 2-4 行，简洁精准
+- 不要解释推理过程，直接输出三层内容
+- 不要用星号"""
+
+
+def _decompose_premise(topic: str, context: str, topic_type: str) -> str:
+    """Phase 1: 命题拆解——搜索验证隐性假设，重新定义真正的问题。"""
+    from core.agent import AgentLoop
+    from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, SEARCH_PLATFORM_TOOL
+
+    user_msg = f"命题：{topic}"
+    if context:
+        user_msg += f"\n\n背景材料：\n{context[:5000]}"
+
+    search_hint = (
+        "\n\n你拥有搜索工具，必须在输出前搜索验证：\n"
+        "1. 搜索 [时间+地点+形式] 了解竞争态势（同期同地有谁在做什么）\n"
+        "2. 搜索 [品牌+类似活动] 看过去做过什么、什么有效\n"
+        "3. 如有必要搜索行业趋势或社交平台热度\n"
+        "2-3 次搜索足够，重点放在验证隐性假设。"
+    )
+
+    try:
+        agent = AgentLoop(
+            provider="deepseek",
+            system=_DECOMPOSE_SYSTEM + search_hint,
+            max_rounds=4,
+            temperature=0.5,
+            on_tool_call=lambda name, args: print(f"  🔍 [命题拆解] {name}: {str(args)[:80]}", flush=True),
+        )
+        agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, SEARCH_PLATFORM_TOOL])
+        result = agent.run(user_msg)
+        if result.tool_calls_made:
+            print(f"  [命题拆解] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+        return result.content.strip()
+    except Exception as e:
+        print(f"  [命题拆解] 失败({e}), 跳过", flush=True)
+        return ""
+
+
+def _strip_preamble(text: str) -> str:
+    """去掉 DeepSeek 在结构化输出前加的废话（如"基于搜索结果，我来..."）。"""
+    idx = text.find("---")
+    if 0 < idx < 300:
+        return text[idx:]
+    for marker in ("INSIGHT LAYER", "显性要素", "#brainstorm"):
+        idx = text.find(marker)
+        if 0 < idx < 300:
+            return text[idx:]
+    return text
+
+
+def _fix_raw_topic(output: str, original_topic: str) -> str:
+    """校验"原始主题："是否被篡改，如果被改了则修正回用户原文。"""
+    import re
+    pattern = re.compile(r"(原始主题[：:]\s*\n?)(.+?)(\n|$)", re.DOTALL)
+    match = pattern.search(output)
+    if match:
+        found_topic = match.group(2).strip()
+        if found_topic != original_topic.strip():
+            print(f"  [修正] 原始主题被篡改，已修正回用户原文", flush=True)
+            return output[:match.start(2)] + original_topic.strip() + output[match.end(2):]
+    return output
+
+
+def refine_brainstorm_topic_deepseek(topic: str, context: str, topic_type: str = "campaign") -> tuple[str, str]:
+    """两步法优化脑暴主题：先命题拆解，再生成 Brainstorm Seed。
+
+    返回 (brainstorm_seed, decomposition_context)。
+    """
     from core.agent import AgentLoop
     from core.tools import WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL
     from skills import collect_tools as _collect_skill_tools
 
-    user = f"""Input: Raw brainstorming topic and background materials below.
+    # ── Phase 1: 命题拆解 ──
+    print("  [Phase 1] 命题拆解中...", flush=True)
+    decomposition = _decompose_premise(topic, context, topic_type)
+    if decomposition:
+        print("  [Phase 1] 命题拆解完成", flush=True)
+    else:
+        print("  [Phase 1] 命题拆解跳过，Phase 2 将自行搜索", flush=True)
 
-Output: First complete PREMISE DECOMPOSITION (命题拆解), then the INSIGHT LAYER, then the Brainstorm Seed. In the #brainstorm section you must include "原始主题：" and copy the raw topic below verbatim (一字不改). All content in Chinese (中文). No asterisks; plain text only.
+    # ── Phase 2: 生成 Brainstorm Seed ──
+    decomp_block = ""
+    if decomposition:
+        decomp_block = f"\n\n━━ 命题拆解结果（已搜索验证）━━\n{decomposition}\n━━━━━━━━━━━━━━━━━━━━\n"
 
-IMPORTANT: Before writing anything, use search tools to decompose the premise — understand the competitive context, validate implicit assumptions, and reframe the real question.
-
----
+    user = f"""以下是用户的脑暴命题和背景材料。{decomp_block}
+你的回复必须以 "---" 开头，直接输出结构化内容。禁止任何开场白或解释。
+"原始主题：" 后面必须一字不改地复制下面的 Raw topic。
 
 Raw topic:
 {topic}
@@ -471,41 +526,47 @@ Background materials:
 {context[:30000] if len(context) > 30000 else context}"""
 
     refine_sys = _REFINE_SYSTEMS.get(topic_type, REFINE_SYSTEM_CAMPAIGN)
-    refine_sys += (
-        "\n\n你拥有搜索工具。在命题拆解阶段必须搜索来验证你的判断：\n"
-        "1. 场景情报：搜索命题中提到的 [时间+地点+形式] 或 [领域+类型] 组合，了解竞争态势和行业背景（用 web_search 或 news_search）\n"
-        "2. 品牌/项目历史：搜索相关品牌或领域做过的类似事情，看什么有效什么没效\n"
-        "3. 隐含语境验证：基于你发现的隐性假设，搜索确认是否属实\n"
-        "4. 如果涉及社交平台，用 search_platform 看看相关话题热度和角度\n"
-        "3-4 次搜索足够，重点放在验证隐性假设上——这决定了脑暴的方向是否正确。"
-    )
+    if not decomposition:
+        refine_sys += (
+            "\n\n你拥有搜索工具。由于命题拆解阶段跳过了，你需要自行搜索：\n"
+            "1. 场景情报：搜索 [时间+地点+形式] 了解竞争态势\n"
+            "2. 品牌历史：搜索 [品牌+类似活动]\n"
+            "3-4 次搜索足够。"
+        )
 
     try:
         from core.skill_router import enrich_prompt
-        refine_sys = enrich_prompt(refine_sys, user_text=user, bot_type="brainstorm")
+        refine_sys = enrich_prompt(refine_sys, user_text=topic, bot_type="brainstorm")
     except Exception:
         pass
 
     try:
+        tools = _collect_skill_tools()
+        if not decomposition:
+            tools = [WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL] + tools
         agent = AgentLoop(
             provider="deepseek",
             system=refine_sys,
-            max_rounds=5,
+            max_rounds=3 if decomposition else 5,
             temperature=0.7,
-            on_tool_call=lambda name, args: print(f"  🔍 [主题调研] {name}: {str(args)[:80]}", flush=True),
+            on_tool_call=lambda name, args: print(f"  🔍 [Seed生成] {name}: {str(args)[:80]}", flush=True),
         )
-        agent.add_tools([WEB_SEARCH_TOOL, NEWS_SEARCH_TOOL, TRENDING_TOOL, SEARCH_PLATFORM_TOOL]
-                        + _collect_skill_tools())
+        agent.add_tools(tools)
         result = agent.run(user)
         if result.tool_calls_made:
-            print(f"  [主题优化] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
-        return result.content
+            print(f"  [Seed生成] 搜索了 {len(result.tool_calls_made)} 次", flush=True)
+        raw = result.content
     except Exception as e:
-        print(f"  [主题优化] AgentLoop 失败({e}), 回退简单调用", flush=True)
+        print(f"  [Seed生成] AgentLoop 失败({e}), 回退简单调用", flush=True)
         try:
-            return chat_completion(provider="deepseek", system=refine_sys, user=user).strip()
+            raw = chat_completion(provider="deepseek", system=refine_sys, user=user).strip()
         except Exception:
-            return ""
+            raw = ""
+
+    if raw:
+        raw = _strip_preamble(raw)
+        raw = _fix_raw_topic(raw, topic)
+    return (raw.strip() if raw else "", decomposition)
 
 
 # ── 角色 & 轮次配置 ─────────────────────────────────────────
@@ -1031,6 +1092,10 @@ def run_brainstorm(
     brand: 可选，指定品牌名。留空则自动从 topic/context 中检测。
     topic_type: 手动指定话题类型 (campaign/project/strategy/explore)，留空则自动检测。
     """
+    # ── 清除缓存，避免旧状态污染 ──
+    global _PROMPTS_JSON_CACHE
+    _PROMPTS_JSON_CACHE = None
+
     resolved_webhook = (webhook or "").strip() or (_os.environ.get("FEISHU_WEBHOOK") or "").strip() or None
 
     if not topic_type or topic_type not in ("campaign", "project", "strategy", "explore"):
@@ -1061,6 +1126,7 @@ def run_brainstorm(
     round_summaries: list[str] = []
     topic_refined = ""
     final_output = ""
+    decomposition_context = ""
     session_lines = [
         f"# Session {ts}",
         f"Topic (raw): {topic}",
@@ -1071,7 +1137,19 @@ def run_brainstorm(
 
     if not no_refine:
         print("[DeepSeek] 正在优化脑暴主题与讨论思路...", flush=True)
-        refined = refine_brainstorm_topic_deepseek(topic, context, topic_type=topic_type)
+        refined, decomposition_context = refine_brainstorm_topic_deepseek(topic, context, topic_type=topic_type)
+        if decomposition_context:
+            session_lines.append("━━ 命题拆解 ━━")
+            session_lines.append("")
+            session_lines.append(decomposition_context)
+            session_lines.append("")
+            session_lines.append("---")
+            session_lines.append("")
+            _send_brainstorm_card("命题拆解", truncate_for_display(decomposition_context), color="wathet", webhook_override=resolved_webhook)
+            time.sleep(FEISHU_INTERVAL)
+            # 注入到 context 中，让后续所有角色都能看到竞争环境分析
+            decomp_injection = f"━━ 命题拆解（已搜索验证）━━\n{decomposition_context}"
+            context = f"{decomp_injection}\n\n{context}" if context else decomp_injection
         if refined:
             topic = refined
             topic_refined = refined
