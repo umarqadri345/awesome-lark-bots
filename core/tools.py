@@ -420,7 +420,7 @@ def _get_user_context(scope: str = "all", *, _open_id: str = "") -> str:
                 for info in threads[:8]:
                     t = info["thread"]
                     latest = info.get("latest_content", "")[:40]
-                    thread_lines.append(f"  #{t}（{info['count']}条）— {latest}")
+                    thread_lines.append(f"  #{t}（{info.get('pending', info['count'])}条待办）— {latest}")
                 parts.append("\n".join(thread_lines))
         except Exception:
             pass

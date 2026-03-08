@@ -130,7 +130,13 @@ def list_memos(
 
 
 def list_threads(user_open_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """列出所有线程及其统计。返回 [{thread, count, latest_at, latest_content}]。"""
+    """列出所有线程及其统计。
+
+    返回 [{thread, count, pending, done, latest_at, latest_content}]。
+    - count: 总条数
+    - pending: 未完成条数
+    - done: 已完成条数
+    """
     with _lock:
         items = _load_all_unlocked()
     if user_open_id:
@@ -142,8 +148,15 @@ def list_threads(user_open_id: Optional[str] = None) -> List[Dict[str, Any]]:
         if not t:
             t = "(未分类)"
         if t not in threads:
-            threads[t] = {"thread": t, "count": 0, "latest_at": "", "latest_content": ""}
+            threads[t] = {
+                "thread": t, "count": 0, "pending": 0, "done": 0,
+                "latest_at": "", "latest_content": "",
+            }
         threads[t]["count"] += 1
+        if m.get("done"):
+            threads[t]["done"] += 1
+        else:
+            threads[t]["pending"] += 1
         created = m.get("created_at", "")
         if created > threads[t]["latest_at"]:
             threads[t]["latest_at"] = created
