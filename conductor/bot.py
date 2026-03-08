@@ -55,7 +55,7 @@ from core.feishu_client import (
     send_message_to_user, send_card_to_user,
 )
 from conductor.config import Platform, log, load_persona_defaults
-from conductor.store import store, ContentStatus
+from conductor.store import store, ContentItem, ContentStatus
 from conductor.pipeline import run_pipeline, PipelineRun
 from conductor.scheduler import Scheduler
 
@@ -256,6 +256,15 @@ def _dispatch(mid: str, text: str, uid: Optional[str], user_key: str):
     if lower.startswith("内容目标") or (lower.startswith("目标") and "受众" not in t[:4]):
         goals = t.split(maxsplit=1)[-1].strip() if len(t.split()) > 1 else ""
         _cmd_content_goals(mid, user_key, goals)
+        return
+
+    # ── 小红书简单模式：跳过 Pipeline，直接创建任务给本地 Claude ──
+    if lower.startswith("xhs:") or lower.startswith("xhs：") or lower.startswith("小红书:") or lower.startswith("小红书："):
+        instruction = re.sub(r'^(xhs|小红书)\s*[：:]\s*', '', t, flags=re.IGNORECASE).strip()
+        if not instruction:
+            reply_message(mid, "请在 xhs: 后面写上发布指令，例如：\nxhs: 写一条关于AI自动化的有趣笔记")
+            return
+        _cmd_xhs_simple(mid, uid, user_key, instruction)
         return
 
     # ── 已有待选选题时，用「脑暴/深度/快速/开始」确认模式
@@ -640,6 +649,42 @@ def _cmd_content_goals(mid: str, user_key: str, goals: str):
     reply_card(mid, _card("内容目标已设置", [{"text": f"**{goals[:80]}**"}], color="green"))
 
 
+def _cmd_xhs_simple(mid: str, uid: Optional[str], user_key: str, instruction: str):
+    """小红书简单模式：跳过 Pipeline，直接创建 ContentItem 交给本地 Claude 处理。"""
+    session = _get_session(user_key)
+
+    item = ContentItem(
+        title=instruction[:50],
+        topic=instruction,
+        brand=session.get("brand", ""),
+        content_type="xhs_note",
+        target_platforms=["xiaohongshu"],
+        status=ContentStatus.READY,
+    )
+
+    content_id = store.save(item)
+    _log(f"小红书简单模式: 已创建任务 {content_id} | {instruction[:60]!r}")
+
+    card = _card("小红书任务已创建", [
+        {"text": f"**指令：**{instruction[:200]}"},
+        {"text": f"**内容 ID：**`{content_id}`"},
+        {"divider": True},
+        {"text": (
+            "本地 Claude 将自动处理：\n"
+            "1. 根据指令生成小红书风格文案\n"
+            "2. 使用「文字配图」生成封面\n"
+            "3. 添加话题标签并发布"
+        )},
+        {"divider": True},
+        {"note": f"查看详情：详情 {content_id}  |  取消任务：删除 {content_id}"},
+    ], color="green")
+
+    if uid:
+        send_card_to_user(uid, card)
+    else:
+        reply_card(mid, card)
+
+
 # ── 结果格式化 ────────────────────────────────────────────────
 
 def _refine_topic_preview(topic: str, session: dict) -> str:
@@ -780,15 +825,16 @@ def _format_result_card(run: PipelineRun) -> dict:
 def _welcome_card() -> dict:
     return _card("Hi! 我是自媒体助手", [
         {"text": (
-            "发一个**选题**，我会先让你选是否走脑暴，再执行：\n"
-            "**扫描热点** → **创意/脑暴** → **生成文案+视觉** → **存到内容仓库**"
+            "**小红书直发（推荐）：**\n"
+            "> xhs: 写一条关于AI的有趣笔记\n"
+            "> 本地 Claude 自动生成文案 + 文字配图 + 发布\n"
         )},
         {"text": (
-            "**提选题后可选模式：**\n"
-            "> 春天穿搭分享\n"
-            "> 机器人会问：脑暴 or 快速？回复「脑暴」或「快速」即可\n\n"
+            "**完整内容生产：**\n"
+            "发一个**选题**，走完整 Pipeline：\n"
+            "**扫描热点** → **创意/脑暴** → **生成文案+视觉** → **存到内容仓库**\n\n"
             "**一步到位：**\n"
-            "> 脑暴：咖啡品牌 × 音乐节联动  → 直接走脑暴\n"
+            "> 脑暴：咖啡品牌 × 音乐节联动  → 脑暴讨论后生成\n"
             "> 快速：春天穿搭分享  → 直接快速执行"
         )},
         {"divider": True},
@@ -803,31 +849,37 @@ def _welcome_card() -> dict:
 def _help_card() -> dict:
     return _card("使用帮助", [
         {"text": (
-            "**内容生产（提选题时可选是否脑暴）：**\n"
-            "- 发选题（如「春天穿搭」）→ 会问选**脑暴**还是**快速**，回复对应词即可\n"
-            "- 一步到位：发「**脑暴：**选题」或「**快速：**选题」直接执行\n"
-            "- 脑暴模式约 5–15 分钟，快速模式约 1–3 分钟\n"
+            "**小红书直发（简单模式）：**\n"
+            "- 发「**xhs:** 内容指令」或「**小红书:** 内容指令」\n"
+            "- 本地 Claude 自动生成文案 → 文字配图 → 发布\n"
+            "- 例：`xhs: 分享一个只有AI知道的冷知识`\n"
+        )},
+        {"text": (
+            "**完整内容生产（Pipeline 模式）：**\n"
+            "- 发选题（如「春天穿搭」）→ 选**脑暴**或**快速**模式\n"
+            "- 一步到位：发「**脑暴：**选题」或「**快速：**选题」\n"
+            "- 脑暴约 5–15 分钟，快速约 1–3 分钟\n"
         )},
         {"text": (
             "**内容管理：**\n"
             "- 「**草稿**」→ 查看所有内容\n"
-            "- 「**详情** <id>」→ 查看完整内容（文案+Prompt+素材）\n"
+            "- 「**详情** <id>」→ 查看完整内容\n"
             "- 「**发布** <id>」→ 审批通过\n"
-            "- 「**自动发布** <id> 小红书」→ 通过浏览器自动发布\n"
-            "- 「**定时** <id> 10:00」→ 设置定时发布\n"
+            "- 「**自动发布** <id> 小红书」→ 浏览器自动发布\n"
+            "- 「**定时** <id> 10:00」→ 定时发布\n"
             "- 「**删除** <id>」→ 删除内容\n"
             "- 「**状态**」→ 仓库统计\n"
         )},
         {"text": (
             "**配置：**\n"
             "- 「**品牌** sky」→ 切换品牌\n"
-            "- 「**平台** 小红书 抖音」→ 设置目标平台\n"
-            "- 「**人设** 治愈系旅行博主」→ 发帖口吻/风格\n"
-            "- 「**目标受众** 18-30岁女性」→ 目标受众\n"
+            "- 「**平台** 小红书 抖音」→ 目标平台\n"
+            "- 「**人设** 治愈系旅行博主」→ 发帖风格\n"
+            "- 「**目标受众** 18-30岁女性」→ 受众画像\n"
             "- 「**内容目标** 涨粉种草」→ 内容目标\n"
         )},
         {"divider": True},
-        {"note": "LLM: DeepSeek  |  品牌/平台可在对话中设置"},
+        {"note": "简单模式：本地 Claude  |  Pipeline 模式：DeepSeek"},
     ], color="blue")
 
 

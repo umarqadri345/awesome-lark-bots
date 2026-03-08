@@ -26,7 +26,8 @@ from typing import Optional
 
 log = logging.getLogger("skill_router")
 
-_MAX_SKILL_CHARS = 50000
+_MAX_SKILL_CHARS = 10000
+_MAX_SKILL_COUNT = 2
 
 _SKILL_PRIORITY = [
     "decision_frameworks", "thinking_models", "personal",
@@ -82,6 +83,7 @@ def enrich_prompt(
         except ValueError:
             return len(_SKILL_PRIORITY)
     skills_to_load.sort(key=_sort_key)
+    skills_to_load = skills_to_load[:_MAX_SKILL_COUNT]
 
     chunks = []
     total = 0

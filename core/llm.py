@@ -3,21 +3,20 @@
 LLM 调用统一封装层 —— 所有机器人调用大模型都经过这里。
 =====================================
 
-本项目同时使用三家大模型服务商，它们都兼容 OpenAI 的 API 协议：
+本项目支持多家大模型服务商，均兼容 OpenAI API 协议：
   - DeepSeek ：主力模型，用于规划、助手、脑暴中的策略角色
   - 豆包(Doubao)：字节跳动的模型，用于脑暴中的创意角色
   - Kimi      ：月之暗面的模型，用于脑暴中的素材/体验角色
+  - Gemini    ：Google 的模型，可通过 BRAINSTORM_PROVIDER=gemini 一键切换
 
 对外暴露两个函数：
   - chat_completion(): 完整调用，支持指定 provider、多轮对话、自动重试
   - chat()          : 快速调用 DeepSeek，适合意图解析、摘要等轻量场景
 
-使用示例：
-  >>> from core.llm import chat_completion, chat
-  >>> # 完整调用
-  >>> result = chat_completion(provider="deepseek", system="你是助手", user="你好")
-  >>> # 快速调用
-  >>> reply = chat("帮我总结一下今天的日程")
+可插拔模型切换（脑暴角色）：
+  - BRAINSTORM_PROVIDER=gemini   → 所有脑暴角色使用 Gemini
+  - ROLE_PROVIDER_芝麻仁=gemini  → 单独覆盖某个角色的 provider
+  - 不设环境变量则使用 ROLE_PROVIDER 字典中的默认值
 """
 import os
 import time
@@ -51,6 +50,13 @@ def _get_client(provider: str):
         model = os.environ.get("KIMI_MODEL", "moonshot-v1-128k")
         return OpenAI(base_url=base.rstrip("/"), api_key=key, timeout=timeout), model
 
+    if provider == "gemini":
+        base = os.environ.get("GEMINI_BASE_URL",
+                              "https://generativelanguage.googleapis.com/v1beta/openai/")
+        key = os.environ.get("GEMINI_API_KEY", "")
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        return OpenAI(base_url=base.rstrip("/"), api_key=key, timeout=timeout), model
+
     # 未匹配的 provider 一律走 DeepSeek
     base = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -82,7 +88,20 @@ ROLE_PROVIDER = {
 
 
 def get_model_for_role(role_name: str) -> str:
-    """根据角色名查找该角色应该使用哪个 LLM provider。找不到则默认 deepseek。"""
+    """根据角色名查找该角色应该使用哪个 LLM provider。
+
+    优先级：
+      1. ROLE_PROVIDER_{角色名} 环境变量（精细覆盖单个角色）
+      2. BRAINSTORM_PROVIDER 环境变量（一键切换所有脑暴角色）
+      3. ROLE_PROVIDER 字典默认值
+      4. 兜底 deepseek
+    """
+    per_role = os.environ.get(f"ROLE_PROVIDER_{role_name}", "").strip()
+    if per_role:
+        return per_role
+    global_override = os.environ.get("BRAINSTORM_PROVIDER", "").strip()
+    if global_override:
+        return global_override
     return ROLE_PROVIDER.get(role_name, "deepseek")
 
 
@@ -108,7 +127,7 @@ def chat_completion(
     调用 LLM 并返回文本结果。
 
     参数说明：
-      provider       : 模型服务商，"deepseek" / "doubao" / "kimi"
+      provider       : 模型服务商，"deepseek" / "doubao" / "kimi" / "gemini"
       system         : 系统提示词（设定 AI 角色和行为规则）
       user           : 用户消息（你想让 AI 回答的内容）
       messages       : 多轮对话时直接传完整消息列表，此时 system/user 会被忽略

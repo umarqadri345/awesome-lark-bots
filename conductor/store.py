@@ -118,11 +118,21 @@ class ContentStore:
         self._lock = threading.Lock()
 
     def save(self, item: ContentItem) -> str:
-        """保存内容项，返回 content_id。"""
+        """保存内容项，返回 content_id。同时同步到飞书 Bitable。"""
         with self._lock:
             item.save()
             log.info("内容已保存: %s [%s] %s", item.content_id, item.status, item.title[:40])
-            return item.content_id
+        self._sync_bitable(item)
+        return item.content_id
+
+    @staticmethod
+    def _sync_bitable(item: ContentItem) -> None:
+        """异步同步到 Bitable（不阻塞主流程）。"""
+        try:
+            from conductor.bitable_sync import sync_to_bitable
+            threading.Thread(target=sync_to_bitable, args=(item,), daemon=True).start()
+        except Exception as e:
+            log.warning("Bitable 同步启动失败: %s", e)
 
     def get(self, content_id: str) -> Optional[ContentItem]:
         return ContentItem.load(content_id)
@@ -167,7 +177,8 @@ class ContentStore:
             item.status = ContentStatus.READY
             item.save()
             log.info("内容已审批: %s [%s] %s", item.content_id, item.status, item.title[:40])
-            return True
+        self._sync_bitable(item)
+        return True
 
     def schedule(self, content_id: str, publish_time: float) -> bool:
         """设置定时发布。"""
@@ -179,7 +190,8 @@ class ContentStore:
             item.scheduled_at = publish_time
             item.save()
             log.info("已设置定时发布: %s → %s", content_id, time.strftime("%Y-%m-%d %H:%M", time.localtime(publish_time)))
-            return True
+        self._sync_bitable(item)
+        return True
 
     def mark_published(self, content_id: str, platform: str, url: str = "") -> bool:
         """标记为已发布。"""
@@ -193,7 +205,8 @@ class ContentStore:
                 item.publish_urls[platform] = url
             item.save()
             log.info("内容已发布: %s [%s] %s", item.content_id, item.status, item.title[:40])
-            return True
+        self._sync_bitable(item)
+        return True
 
     def mark_failed(self, content_id: str, platform: str, error: str) -> bool:
         """标记发布失败。"""
@@ -205,7 +218,8 @@ class ContentStore:
             item.publish_errors[platform] = error
             item.save()
             log.info("内容发布失败: %s [%s] %s", item.content_id, platform, error[:80])
-            return True
+        self._sync_bitable(item)
+        return True
 
     def update_metrics(self, content_id: str, platform: str, metrics: dict) -> bool:
         """更新内容的效果数据。"""

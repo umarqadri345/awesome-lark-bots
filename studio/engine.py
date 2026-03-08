@@ -519,3 +519,177 @@ def run_creative_engine(
         }
 
     return run_with_progress(_run, progress_container)
+
+
+# ── 决策助手（卡住了？）──────────────────────────────────────
+
+import csv
+import io
+import json as _json
+from datetime import datetime
+
+_DECISION_LOG_PATH = Path(__file__).resolve().parent / "decision_logs.json"
+_ESCALATION_RULES_PATH = Path(__file__).resolve().parent / "escalation_rules.md"
+
+_LEVELS = ("必须找 Leader", "先试后再找 Leader", "自己说了算")
+
+
+def load_escalation_rules() -> str:
+    if _ESCALATION_RULES_PATH.exists():
+        return _ESCALATION_RULES_PATH.read_text(encoding="utf-8")
+    return ""
+
+
+def save_escalation_rules(content: str) -> None:
+    _ESCALATION_RULES_PATH.write_text(content, encoding="utf-8")
+
+
+def run_decision_engine(
+    situation: str,
+    owner: str = "",
+    options_text: str = "",
+    skill_context: str = "",
+    progress_container=None,
+) -> dict:
+    """
+    Step 1: 根据升级规则对场景分类。
+    Step 2: 生成结构化决策日志条目。
+    """
+    from core.llm import chat_completion
+
+    _disable_feishu()
+
+    if progress_container is None:
+        import streamlit as st
+        progress_container = st.empty()
+
+    rules = load_escalation_rules()
+
+    def _run():
+        print("[分类] 正在判断升级级别…", flush=True)
+        classify_system = (
+            "你是一个团队决策顾问。根据以下升级规则，判断用户描述的场景属于哪个级别。\n\n"
+            "快速判断：如果「不超预算」「不影响品牌风险」「不影响重要合作关系」三项都满足，"
+            "则属于「自己说了算」。\n\n"
+            "# 升级规则\n" + rules + "\n\n"
+            "请严格按以下 JSON 格式输出（不要输出其他内容）：\n"
+            '{"level": "必须找 Leader" 或 "先试后再找 Leader" 或 "自己说了算",\n'
+            ' "matched_rule": "匹配到的具体规则编号和名称",\n'
+            ' "reason": "1-2句判断理由",\n'
+            ' "suggestion": "建议的处理流程（3-5步）"}'
+        )
+        classify_input = f"场景描述：{situation}"
+        if owner:
+            classify_input += f"\n负责人：{owner}"
+        if options_text:
+            classify_input += f"\n已有备选方案：{options_text}"
+        if skill_context:
+            classify_input += f"\n\n{skill_context}"
+
+        raw = chat_completion(
+            provider="deepseek", system=classify_system,
+            user=classify_input, temperature=0.3,
+        ).strip()
+        print("[分类] 完成", flush=True)
+
+        classification = {}
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                classification = _json.loads(raw[start:end])
+        except _json.JSONDecodeError:
+            classification = {
+                "level": "无法判断",
+                "matched_rule": "",
+                "reason": raw[:200],
+                "suggestion": "建议手动检查升级规则。",
+            }
+
+        print("[日志] 正在生成决策日志…", flush=True)
+        log_system = (
+            "根据以下信息，生成一条简洁的决策日志。\n\n"
+            "格式要求（严格按此 JSON 输出）：\n"
+            '{"date": "YYYY-MM-DD",\n'
+            ' "owner": "负责人",\n'
+            ' "problem": "发生了什么（1句话）",\n'
+            ' "options": "A xxx / B xxx",\n'
+            ' "decision": "最终选择",\n'
+            ' "budget_impact": "预算内" 或 ">10000" 或 "超预算",\n'
+            ' "risk_level": "低" 或 "中" 或 "高",\n'
+            ' "reason": "1句话原因"}'
+        )
+        log_input = (
+            f"场景：{situation}\n"
+            f"负责人：{owner or '未填写'}\n"
+            f"备选方案：{options_text or '无'}\n"
+            f"升级级别：{classification.get('level', '未知')}\n"
+            f"AI建议：{classification.get('suggestion', '')}"
+        )
+
+        log_raw = chat_completion(
+            provider="deepseek", system=log_system,
+            user=log_input, temperature=0.3,
+        ).strip()
+        print("[日志] 完成", flush=True)
+
+        log_entry = {}
+        try:
+            start = log_raw.find("{")
+            end = log_raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                log_entry = _json.loads(log_raw[start:end])
+        except _json.JSONDecodeError:
+            log_entry = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "owner": owner or "未填写",
+                "problem": situation[:100],
+                "options": options_text or "—",
+                "decision": "待定",
+                "budget_impact": "预算内",
+                "risk_level": "低",
+                "reason": "AI 解析失败，请手动填写",
+            }
+
+        if "date" not in log_entry:
+            log_entry["date"] = datetime.now().strftime("%Y-%m-%d")
+
+        return {
+            "classification": classification,
+            "log_entry": log_entry,
+            "raw_classify": raw,
+            "raw_log": log_raw,
+        }
+
+    return run_with_progress(_run, progress_container)
+
+
+def save_decision_log(entry: dict) -> None:
+    entry["saved_at"] = datetime.now().isoformat()
+    with open(_DECISION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_decision_logs() -> list[dict]:
+    if not _DECISION_LOG_PATH.exists():
+        return []
+    logs = []
+    for line in _DECISION_LOG_PATH.read_text(encoding="utf-8").strip().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                logs.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+    return list(reversed(logs))
+
+
+def export_decision_csv(logs: list[dict]) -> str:
+    output = io.StringIO()
+    fields = ["date", "owner", "problem", "options", "decision",
+              "budget_impact", "risk_level", "reason", "level", "saved_at"]
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for log in logs:
+        writer.writerow(log)
+    return output.getvalue()

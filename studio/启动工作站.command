@@ -38,6 +38,14 @@ if ! python3 -c "import streamlit" 2>/dev/null; then
     echo "  ✓ 依赖安装完成"
 fi
 
+# ── 跳过 Streamlit 首次邮箱提示 ──
+STREAMLIT_CFG_DIR="$HOME/.streamlit"
+mkdir -p "$STREAMLIT_CFG_DIR"
+if [ ! -f "$STREAMLIT_CFG_DIR/credentials.toml" ]; then
+    echo '[general]' > "$STREAMLIT_CFG_DIR/credentials.toml"
+    echo 'email = ""' >> "$STREAMLIT_CFG_DIR/credentials.toml"
+fi
+
 # ── 启动应用 ──
 echo ""
 echo "  🚀 正在启动..."

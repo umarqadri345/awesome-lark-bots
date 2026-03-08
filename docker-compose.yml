@@ -56,3 +56,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./runs:/app/runs
+
+  studio:
+    build: .
+    command: streamlit run studio/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath studio --server.enableXsrfProtection false
+    env_file: .env
+    restart: always
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data

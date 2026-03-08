@@ -10,6 +10,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+from auth import require_auth
+require_auth()
+
 from engine import (
     MODEL_SLOTS, PRESETS, check_keys, save_env, load_env,
     all_keys_ready, detect_preset,
@@ -50,9 +53,10 @@ modes = [
     ("📋", t("mode_plan", lang), t("mode_plan_d", lang)),
     ("🎨", t("mode_create", lang), t("mode_create_d", lang)),
     ("🔍", t("mode_research", lang), t("mode_research_d", lang)),
+    ("🚦", t("mode_stuck", lang), t("mode_stuck_d", lang)),
 ]
 
-cols = st.columns(4, gap="medium")
+cols = st.columns(5, gap="medium")
 for i, (icon, title, desc) in enumerate(modes):
     with cols[i]:
         with st.container(border=True):

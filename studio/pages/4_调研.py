@@ -4,6 +4,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Research", page_icon="🔍", layout="wide")
 
+from auth import require_auth
+require_auth()
+
 from engine import all_keys_ready, run_research_engine, list_skills, build_skill_context
 from i18n import t, output_lang_instruction
 
