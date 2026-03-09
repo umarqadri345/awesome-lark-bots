@@ -22,6 +22,32 @@ _DEFAULT_PATH = str(Path(__file__).resolve().parent.parent / "data" / "memos.jso
 _lock = threading.Lock()
 
 
+def _sync_board_done(memo_id: str) -> None:
+    """完成备忘后同步看板状态（异步，不阻塞主流程）。"""
+    if not memo_id:
+        return
+    try:
+        from memo.bitable_board import mark_board_record_done
+        threading.Thread(
+            target=mark_board_record_done, args=(memo_id,), daemon=True,
+        ).start()
+    except Exception:
+        pass  # 看板同步失败不影响主流程
+
+
+def _sync_board_delete(memo_id: str) -> None:
+    """删除备忘后清理看板记录（异步，不阻塞主流程）。"""
+    if not memo_id:
+        return
+    try:
+        from memo.bitable_board import delete_board_record
+        threading.Thread(
+            target=delete_board_record, args=(memo_id,), daemon=True,
+        ).start()
+    except Exception:
+        pass  # 看板同步失败不影响主流程
+
+
 def _path() -> str:
     return (os.environ.get("MEMO_STORE_PATH") or "").strip() or _DEFAULT_PATH
 
@@ -259,6 +285,7 @@ def complete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = N
                 break
         _save_all_unlocked(all_items)
     tag = f" #{thread}" if thread else ""
+    _sync_board_done(memo_id)
     return True, f"✅ 已完成第 {index_one_based} 条{tag}：{content_preview}"
 
 
@@ -292,6 +319,7 @@ def complete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -
                 break
         _save_all_unlocked(all_items)
     tag = f" #{thread}" if thread else ""
+    _sync_board_done(memo_id)
     return True, f"✅ 已完成{tag}：{content_preview}"
 
 
@@ -339,6 +367,7 @@ def delete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = Non
         content_preview = (to_remove.get("content") or "")[:20]
         all_items = [m for m in all_items if m.get("id") != memo_id]
         _save_all_unlocked(all_items)
+    _sync_board_delete(memo_id)
     return True, f"已清除第 {index_one_based} 条备忘：{content_preview}{'…' if len(to_remove.get('content') or '') > 20 else ''}"
 
 
@@ -367,6 +396,7 @@ def delete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -> 
         all_items = [m for m in all_items if m.get("id") != memo_id]
         _save_all_unlocked(all_items)
     tag = f" #{thread}" if thread else ""
+    _sync_board_delete(memo_id)
     return True, f"🗑️ 已删除备忘{tag}：{content_preview}"
 
 

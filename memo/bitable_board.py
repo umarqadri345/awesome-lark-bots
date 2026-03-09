@@ -364,3 +364,58 @@ def append_board_record(
     except Exception as e:
         _log(f"追加看板记录异常: {e}")
         return False, str(e)
+
+
+# ── 单条同步 ─────────────────────────────────────────────────
+
+def mark_board_record_done(memo_id: str) -> bool:
+    """按 memo_id 把看板中对应记录标记为已完成。"""
+    if not memo_id:
+        return False
+    from core.feishu_client import list_bitable_records, update_bitable_record
+
+    app, tid = _get_ids()
+    if not app or not tid:
+        return False
+
+    ok, records = list_bitable_records(app, tid)
+    if not ok or not records:
+        return False
+
+    for rec in records:
+        fields = rec.get("fields") or {}
+        if fields.get("memo_id") == memo_id:
+            record_id = rec.get("record_id")
+            if record_id:
+                update_bitable_record(app, tid, record_id, {
+                    "状态": "已完成",
+                    "分区": "已完成",
+                })
+                _log(f"看板同步: {memo_id[:8]}… → 已完成")
+                return True
+    return False
+
+
+def delete_board_record(memo_id: str) -> bool:
+    """按 memo_id 删除看板中对应记录。"""
+    if not memo_id:
+        return False
+    from core.feishu_client import list_bitable_records, batch_delete_bitable_records
+
+    app, tid = _get_ids()
+    if not app or not tid:
+        return False
+
+    ok, records = list_bitable_records(app, tid)
+    if not ok or not records:
+        return False
+
+    for rec in records:
+        fields = rec.get("fields") or {}
+        if fields.get("memo_id") == memo_id:
+            record_id = rec.get("record_id")
+            if record_id:
+                batch_delete_bitable_records(app, tid, [record_id])
+                _log(f"看板同步: {memo_id[:8]}… → 已删除")
+                return True
+    return False
