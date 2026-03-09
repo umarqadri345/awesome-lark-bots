@@ -30,7 +30,7 @@
 | **自媒体助手** ⚗️ | 自媒体全流程编排：选题→脑暴→创作→质量自动修正→存储，AgentLoop 加持 | 发消息：`春天穿搭分享` 或 `深度：新品发布会` | `python3 -m conductor` |
 | **脑暴机器人** | 5 个 AI 角色 + AgentLoop 联网调研，四种模式 + 飞书文档读取 | 发消息：`策略：增长靠补贴还是产品` / 粘贴飞书链接 | `python3 -m brainstorm` |
 | **规划机器人** | 六步规划（每步可联网搜索）+ Agency 比稿 + 飞书文档读写 + Handoff 卡片 | 发消息：`规划：Q3 策略` / 粘贴飞书链接 | `python3 -m planner` |
-| **助手机器人** | 备忘+线程、项目管理（Bitable）、财务、翻译、智能聊天（AgentLoop） | 发消息：`创建项目 Q2营销` / `翻译 xxx` | `python3 -m assistant` |
+| **助手机器人** | 备忘+线程（双向同步看板）、项目管理（Bitable）、财务、翻译、智能聊天 | 发消息：`创建项目 Q2营销` / `翻译 xxx` | `python3 -m assistant` |
 | **素材 Bot** | 生成 AI 工具 prompt + 执行 Brief → 多维表格素材管理 | 发消息：`春日樱花的抖音预告` / `安排制作` | `python3 -m creative` |
 | **舆情监控** | 15 个社媒平台 + Web Search（Tavily/DDG）采集，三阶段补量 | 发消息：`周报` / `采集 咖啡品牌 @微博 7天` | `python3 -m sentiment` |
 | **早知天下事** | 多源新闻聚合 + AI 分析，每日推送新闻简报 | 发消息：`新闻` / `科技新闻` | `python3 -m newsbot` |
@@ -249,11 +249,13 @@ python3 -m pitch --topic "618 大促营销方案"
 
 全能工作搭档：备忘+线程、项目管理、财务管理、翻译、联网研究、日/周/月报。普通聊天使用 AgentLoop（可联网搜索、查用户上下文、查团队决策）。
 
+**消息聚合：** 飞书自动拆分的长消息会被合并后再处理（2.5 秒窗口），短指令即时响应。
+
 **备忘 + 工作线程：**
 ```
 备忘 完成 deck #creator    → 记备忘并归入 #creator 线程
-线程 / 周报 / 看板         → 查看线程 · 导出飞书表格
-完成 3 / 完成 买牛奶       → 标记完成
+线程 / 周报 / 看板         → 查看线程 · 导出飞书表格（双向同步：Bitable 改状态 ↔ 本地）
+完成 3 / 完成 1,2,3        → 标记完成（支持批量）
 ```
 
 **项目管理（飞书多维表格 Bitable）：**
@@ -431,7 +433,7 @@ awesome-lark-bots/
 │   ├── llm.py                #   大模型调用封装（DeepSeek/豆包/Kimi，支持 function calling）
 │   ├── agent.py              #   通用 AgentLoop 运行时（tool-calling 循环，任何 bot 可用）
 │   ├── tools.py              #   LLM 可调用工具库（搜索/热点/品牌/平台/文案框架/团队决策）
-│   ├── feishu_client.py      #   飞书 API（消息、日历、文档、多维表格 Bitable、Wiki）
+│   ├── feishu_client.py      #   飞书 API（消息、日历、文档、多维表格 Bitable、Wiki、云空间 Drive）
 │   ├── doc_reader.py         #   飞书文档读取（检测链接 → 拉取内容 → Kimi 长文摘要）
 │   ├── feishu_webhook.py     #   飞书群 Webhook 推送
 │   ├── skill_router.py       #   技能路由器（自动注入领域知识到 prompt）
@@ -493,12 +495,12 @@ awesome-lark-bots/
 │   └── __main__.py           #   启动入口：python3 -m sentiment
 │
 ├── memo/                     # 备忘 + 项目 + 财务模块（助手机器人使用）
-│   ├── store.py              #   备忘本地存储（线程安全，支持 #thread 标签、看板导出）
+│   ├── store.py              #   备忘本地存储（线程安全，支持 #thread、看板双向同步）
 │   ├── intent.py             #   意图解析（30+ 指令：备忘/项目/财务/研究/日程）
 │   ├── threads.py            #   线程自动识别（从 personal skill 信号词）
 │   ├── projects.py           #   项目注册表（name → 飞书多维表格 token 映射）
 │   ├── finance.py            #   财务管理（记账/预算/目标/月度汇总，自动同步 Bitable）
-│   ├── bitable_board.py      #   备忘看板（飞书多维表格，按线程分区）
+│   ├── bitable_board.py      #   备忘看板（飞书多维表格，双向同步状态，按线程分区）
 │   └── bitable_hub.py        #   项目管理中心（飞书多维表格：项目·任务·资料库·花费·预算·KPI）
 │
 ├── cal/                      # 日程模块（助手机器人使用）
@@ -529,6 +531,12 @@ awesome-lark-bots/
 │   ├── i18n.py               #   中英双语 UI
 │   ├── pages/                #   灵感 / 规划 / 创作 / 调研 四个页面
 │   └── run.sh                #   一键启动脚本
+│
+├── claude_tasks/              # Claude Code 任务集成（看板轮询 → 自动执行 → 回写结果）
+│   ├── poll_tasks.py         #   轮询看板中 @claude 任务，按优先级分配
+│   ├── complete_task.py      #   任务完成后回写 Bitable 状态 + Claude备注
+│   ├── create_doc.py         #   为任务创建飞书文档并关联
+│   └── notify.py             #   任务状态变更通知
 │
 ├── CN-MKT-Skills/            # 营销技能知识库（规划机器人可参考）
 ├── briefs/                   # 脑暴主题 brief 文件
@@ -744,7 +752,7 @@ Most work scenarios don't require handing over all the keys. A chat window + a f
 | **Content Assistant** ⚗️ | End-to-end content pipeline with AgentLoop: topic → brainstorm → create (auto quality revision) → store → handoff prompts | `python3 -m conductor` |
 | **Brainstorm** | 5 AI personas + AgentLoop research, 4 modes (marketing/project/strategy/explore), Feishu doc reading | `python3 -m brainstorm` |
 | **Planner** | 6-step planning (each step can search), Agency Pitch, Feishu doc read/write (10 types), handoff cards | `python3 -m planner` |
-| **Assistant** | Memos, project management (Bitable), finance, translation (CN↔EN), smart chat (AgentLoop) | `python3 -m assistant` |
+| **Assistant** | Memos + bi-directional Bitable sync, project management, finance, translation (CN↔EN), smart chat | `python3 -m assistant` |
 | **Creative Prompt** | Generate AI tool prompts (with trend research) + exec brief → Bitable asset tracker | `python3 -m creative` |
 | **Sentiment Monitor** | 3-phase pipeline: 15 social platforms + Web Search (Tavily/DDG) for ~1000 posts | `python3 -m sentiment` |
 | **News Digest** | Multi-source news aggregation + AI analysis, daily push | `python3 -m newsbot` |

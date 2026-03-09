@@ -8,6 +8,7 @@ memo/bitable_board.py — 备忘看板（独立多维表格）
 
 v2: 新增 memo_id / 执行者 / Claude备注 字段，支持 @claude 任务标记。
     已有看板会自动迁移（补全缺失字段）。
+v3: 新增 搭档反馈 字段，支持用户在 Bitable 里直接给 Claude 反馈。
 
 持久化配置：data/bitable_board.json
 """
@@ -66,6 +67,7 @@ TABLE_DEF = {
             {"name": "Claude"}, {"name": "人工"},
         ]}},
         {"field_name": "Claude备注", "type": 1},
+        {"field_name": "搭档反馈", "type": 1},
     ],
 }
 
@@ -83,6 +85,7 @@ _MIGRATE_FIELDS = [
         {"name": "Claude"}, {"name": "人工"},
     ]}},
     {"field_name": "Claude备注", "type": 1},
+    {"field_name": "搭档反馈", "type": 1},
 ]
 
 
@@ -202,11 +205,48 @@ def _row_to_fields(row: list) -> dict:
 
 # ── 智能刷新（upsert）────────────────────────────────────────
 
+def _reverse_sync_status(existing_records: list) -> int:
+    """反向同步：如果用户在 Bitable 手动改了状态，回写到 memos.json。
+
+    返回同步的条数。
+    """
+    from memo.store import complete_memo_by_id, uncomplete_memo_by_id
+
+    synced = 0
+    for rec in (existing_records or []):
+        fields = rec.get("fields") or {}
+        memo_id = fields.get("memo_id") or ""
+        if not memo_id:
+            continue
+
+        bitable_status = fields.get("状态") or ""
+        # 单选字段可能返回 str 或 dict
+        if isinstance(bitable_status, dict):
+            bitable_status = bitable_status.get("value", "") or bitable_status.get("name", "")
+
+        if bitable_status == "已完成":
+            if complete_memo_by_id(memo_id):
+                _log(f"反向同步: {memo_id[:8]}… → 已完成")
+                synced += 1
+        elif bitable_status in ("进行中", "待跟进"):
+            if uncomplete_memo_by_id(memo_id):
+                _log(f"反向同步: {memo_id[:8]}… → 未完成")
+                synced += 1
+
+    return synced
+
+
 def refresh_board(
     user_open_id: str = "",
     thread: Optional[str] = None,
 ) -> Tuple[bool, str, Dict[str, int]]:
     """智能刷新看板：按 memo_id 匹配，有则更新、无则新增、多余删除。
+
+    流程：
+      0. 反向同步 — 用户在 Bitable 手动改的状态回写 memos.json
+      1. 获取本地最新数据（已包含反向同步的结果）
+      2. Upsert — 有则更新、无则新增
+      3. 清理 — 删除本地已不存在的记录
 
     不会覆盖 Claude备注 字段（由 Claude Code 单独管理）。
 
@@ -228,12 +268,7 @@ def refresh_board(
     if not app or not tid:
         return False, "看板未初始化", {}
 
-    # ① 获取本地最新数据
-    headers, rows, stats = export_board_data(
-        user_open_id=user_open_id, thread=thread,
-    )
-
-    # ② 获取 Bitable 现有记录，建立 memo_id → record_id 映射
+    # ⓪ 获取 Bitable 现有记录
     ok_list, existing = list_bitable_records(app, tid)
     existing_map: Dict[str, str] = {}  # memo_id → record_id
     if ok_list and existing:
@@ -244,7 +279,17 @@ def refresh_board(
             if mid and rid:
                 existing_map[mid] = rid
 
-    # ③ Upsert：遍历本地数据
+        # 反向同步：用户手动改的状态 → memos.json
+        rev_synced = _reverse_sync_status(existing)
+        if rev_synced:
+            _log(f"反向同步完成: {rev_synced} 条状态变更已写回本地")
+
+    # ① 获取本地最新数据（反向同步后的，跳过已完成项）
+    headers, rows, stats = export_board_data(
+        user_open_id=user_open_id, thread=thread, skip_done=True,
+    )
+
+    # ② Upsert：遍历本地数据
     seen_memo_ids = set()
     updated = 0
     created = 0
@@ -265,7 +310,7 @@ def refresh_board(
                 seen_memo_ids.add(memo_id)
             created += 1
 
-    # ④ 清理：删除本地已不存在的记录（但保留无 memo_id 的旧记录）
+    # ③ 清理：删除本地已不存在的记录（但保留无 memo_id 的旧记录）
     stale_record_ids = [
         rid for mid, rid in existing_map.items()
         if mid and mid not in seen_memo_ids

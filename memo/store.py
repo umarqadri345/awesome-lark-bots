@@ -295,6 +295,36 @@ def complete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -
     return True, f"✅ 已完成{tag}：{content_preview}"
 
 
+def complete_memo_by_id(memo_id: str) -> bool:
+    """按 memo_id 标记备忘为已完成。供看板反向同步使用。"""
+    if not memo_id:
+        return False
+    with _lock:
+        items = _load_all_unlocked()
+        for m in items:
+            if m.get("id") == memo_id and not m.get("done"):
+                m["done"] = True
+                m["done_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                _save_all_unlocked(items)
+                return True
+    return False
+
+
+def uncomplete_memo_by_id(memo_id: str) -> bool:
+    """按 memo_id 撤销完成状态。供看板反向同步使用。"""
+    if not memo_id:
+        return False
+    with _lock:
+        items = _load_all_unlocked()
+        for m in items:
+            if m.get("id") == memo_id and m.get("done"):
+                m["done"] = False
+                m.pop("done_at", None)
+                _save_all_unlocked(items)
+                return True
+    return False
+
+
 def delete_memo_by_index(index_one_based: int, user_open_id: Optional[str] = None) -> tuple[bool, str]:
     with _lock:
         all_items = _load_all_unlocked()
@@ -343,11 +373,13 @@ def delete_memo_by_content(keyword: str, user_open_id: Optional[str] = None) -> 
 def export_board_data(
     user_open_id: Optional[str] = None,
     thread: Optional[str] = None,
+    skip_done: bool = False,
 ) -> tuple[list[str], list[list[str]], dict]:
     """把线程备忘导出为分区看板数据。
 
     Args:
         thread: 指定线程名（不含 #），None 则导出所有线程。
+        skip_done: 若 True，跳过已完成的备忘（不导出到看板）。
 
     Returns: (headers, rows, stats)
         stats: {"today": n, "week": n, "stale": n, "done": n}
@@ -378,9 +410,11 @@ def export_board_data(
         assignee = m.get("assignee") or ""
 
         if m.get("done"):
+            stats["done"] += 1
+            if skip_done:
+                continue
             status = "✅ 已完成"
             partition = "已完成"
-            stats["done"] += 1
         elif created.startswith(today_str):
             status = "🆕 进行中"
             partition = "今日新增"

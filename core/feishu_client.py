@@ -1433,3 +1433,165 @@ def get_wiki_node_info(node_token: str) -> Tuple[bool, dict]:
         }
     except Exception as e:
         return False, {"error": f"获取 wiki 节点异常: {e}"}
+
+
+# ── 云空间 Drive 管理 ────────────────────────────────────────
+
+def list_drive_files(
+    folder_token: str = "",
+    page_size: int = 50,
+    order_by: str = "EditedTime",
+    direction: str = "DESC",
+) -> Tuple[bool, list]:
+    """列出云空间文件夹下的文件/文件夹。
+
+    Args:
+        folder_token: 文件夹 token，空字符串表示根目录 ("我的空间")
+        page_size: 每页数量（最大 200）
+        order_by: 排序方式 EditedTime / CreatedTime / Name
+        direction: ASC / DESC
+
+    Returns: (ok, [{"token": str, "name": str, "type": str, "url": str, ...}, ...])
+        type 值: "file" / "docx" / "sheet" / "bitable" / "folder" / "doc" ...
+    """
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/drive/v1/files"
+        params: dict = {
+            "page_size": min(page_size, 200),
+            "order_by": order_by,
+            "direction": direction,
+        }
+        if folder_token:
+            params["folder_token"] = folder_token
+
+        all_files: list = []
+        page_token = None
+        for _ in range(20):  # 防无限循环
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(url, params=params, headers=_headers(token), timeout=15)
+            data = resp.json()
+            if data.get("code") != 0:
+                _warn(f"列出文件失败: {data.get('msg', '')} (code={data.get('code')})")
+                if not all_files:
+                    return False, []
+                break
+            files = (data.get("data") or {}).get("files") or []
+            for f in files:
+                all_files.append({
+                    "token": f.get("token", ""),
+                    "name": f.get("name", ""),
+                    "type": f.get("type", ""),
+                    "url": f.get("url", ""),
+                    "created_time": f.get("created_time", ""),
+                    "modified_time": f.get("modified_time", ""),
+                    "owner_id": f.get("owner_id", ""),
+                })
+            if not (data.get("data") or {}).get("has_more"):
+                break
+            page_token = (data.get("data") or {}).get("page_token")
+            if not page_token:
+                break
+        return True, all_files
+    except Exception as e:
+        _warn(f"列出文件异常: {e}")
+        return False, []
+
+
+def create_drive_folder(
+    name: str,
+    parent_token: str = "",
+) -> Tuple[bool, dict]:
+    """在云空间创建文件夹。
+
+    Args:
+        name: 文件夹名称
+        parent_token: 父文件夹 token，空字符串表示在根目录创建
+
+    Returns: (ok, {"token": str, "url": str} | {"error": str})
+    """
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/drive/v1/files/create_folder"
+        body: dict = {"name": name, "folder_token": parent_token}
+        resp = requests.post(url, json=body, headers=_headers(token), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, {"error": data.get("msg", "创建文件夹失败")}
+        result = data.get("data") or {}
+        return True, {
+            "token": result.get("token", ""),
+            "url": result.get("url", ""),
+        }
+    except Exception as e:
+        return False, {"error": f"创建文件夹异常: {e}"}
+
+
+def move_drive_file(
+    file_token: str,
+    dst_folder_token: str,
+    file_type: str = "",
+) -> Tuple[bool, str]:
+    """移动云空间文件/文件夹到目标文件夹。
+
+    Args:
+        file_token: 要移动的文件 token
+        dst_folder_token: 目标文件夹 token
+        file_type: 文件类型 (file/docx/sheet/bitable/folder 等)，可选
+
+    Returns: (ok, message)
+    """
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/move"
+        body: dict = {"folder_token": dst_folder_token}
+        if file_type:
+            body["type"] = file_type
+        resp = requests.post(url, json=body, headers=_headers(token), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            return False, data.get("msg", "移动文件失败")
+        return True, "移动成功"
+    except Exception as e:
+        return False, f"移动文件异常: {e}"
+
+
+def get_drive_file_meta(
+    file_tokens: list,
+) -> Tuple[bool, list]:
+    """批量获取云空间文件元信息。
+
+    Args:
+        file_tokens: [{"doc_token": str, "doc_type": str}, ...]
+            doc_type: doc/docx/sheet/bitable/file/folder/slides/wiki/mindnote
+
+    Returns: (ok, [{"doc_token": str, "doc_type": str, "title": str,
+                     "owner_id": str, "create_time": str, "latest_modify_time": str,
+                     "url": str}, ...])
+    """
+    try:
+        token = get_user_access_token("doc_create") or get_tenant_access_token()
+        url = f"{FEISHU_API_BASE}/drive/v1/metas/batch_query"
+        body = {"request_docs": file_tokens[:20]}  # API 上限 20
+        resp = requests.post(url, json=body, headers=_headers(token), timeout=15)
+        data = resp.json()
+        if data.get("code") != 0:
+            _warn(f"获取文件元信息失败: {data.get('msg', '')}")
+            return False, []
+        metas = (data.get("data") or {}).get("metas") or []
+        result = []
+        for m in metas:
+            result.append({
+                "doc_token": m.get("doc_token", ""),
+                "doc_type": m.get("doc_type", ""),
+                "title": m.get("title", ""),
+                "owner_id": m.get("owner_id", ""),
+                "create_time": m.get("create_time", ""),
+                "latest_modify_time": m.get("latest_modify_time", ""),
+                "url": m.get("url", ""),
+            })
+        return True, result
+    except Exception as e:
+        _warn(f"获取文件元信息异常: {e}")
+        return False, []

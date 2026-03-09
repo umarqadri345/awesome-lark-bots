@@ -551,6 +551,29 @@ def _smart_chat(text: str, open_id: str) -> str:
             return "（AI 暂时不可用，请稍后再试）"
 
 
+# ── 消息聚合（防止飞书自动拆分长消息） ────────────────────────
+# 同一用户短时间内连续发的消息，等一小段时间后合并处理。
+_MSG_BUFFER: Dict[str, Dict[str, Any]] = {}  # open_id → {messages, timer, last_mid}
+_MSG_BUFFER_LOCK = threading.Lock()
+_MSG_MERGE_DELAY = 2.5  # 秒：收到最后一条消息后等待这么久再处理
+
+
+def _flush_buffer(open_id: str) -> None:
+    """合并缓冲区中的消息并处理。"""
+    with _MSG_BUFFER_LOCK:
+        buf = _MSG_BUFFER.pop(open_id, None)
+    if not buf:
+        return
+    msgs = buf["messages"]
+    last_mid = buf["last_mid"]
+    if len(msgs) > 1:
+        merged_text = "\n".join(msgs)
+        _log(f"消息聚合: {open_id} 合并 {len(msgs)} 条消息，共 {len(merged_text)} 字")
+    else:
+        merged_text = msgs[0]
+    _process_message(last_mid, merged_text, open_id)
+
+
 # ── 消息处理 ─────────────────────────────────────────────────
 
 def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -580,1133 +603,173 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         _log(f"解析消息异常: {e}\n{traceback.format_exc()}")
         return
 
-    def _process(mid: str, text: str, user_open_id: Optional[str]):
-        try:
-            t = (text or "").strip()
+    # 短消息（单条指令）直接处理，不缓冲
+    _quick = user_text.strip().lower()
+    is_quick_cmd = (
+        _quick in ("帮助", "help", "?", "？", "hi", "hello", "你好", "嗨",
+                    "在吗", "在么", "hey", "你可以做什么", "你能做什么",
+                    "你能干嘛", "有什么功能", "介绍下自己", "你是谁")
+        or _quick.startswith(("完成 ", "删除 ", "删掉 "))
+        or len(user_text) <= 15
+    )
+    if is_quick_cmd or not open_id:
+        threading.Thread(
+            target=_process_message, args=(message_id, user_text, open_id),
+            daemon=True,
+        ).start()
+        return
 
-            # 帮助
-            if t.lower() in ("帮助", "help", "?", "？"):
-                reply_card(mid, _help())
-                return
+    # 较长消息 → 进入聚合缓冲区
+    with _MSG_BUFFER_LOCK:
+        if open_id in _MSG_BUFFER:
+            # 取消旧 timer，追加消息
+            _MSG_BUFFER[open_id]["timer"].cancel()
+            _MSG_BUFFER[open_id]["messages"].append(user_text)
+            _MSG_BUFFER[open_id]["last_mid"] = message_id
+            _log(f"消息聚合: 追加第 {len(_MSG_BUFFER[open_id]['messages'])} 条")
+        else:
+            _MSG_BUFFER[open_id] = {
+                "messages": [user_text],
+                "last_mid": message_id,
+                "timer": None,
+            }
+        # 重设 timer
+        timer = threading.Timer(_MSG_MERGE_DELAY, _flush_buffer, args=(open_id,))
+        timer.daemon = True
+        _MSG_BUFFER[open_id]["timer"] = timer
+        timer.start()
+    return
 
-            # 打招呼 / 问「你能做什么」→ 直接回欢迎卡片（否则会走聊天只回文字）
-            _greeting = t.lower().strip()
-            if _greeting in ("hi", "hello", "你好", "嗨", "在吗", "在么", "hey"):
-                _log("发送欢迎卡片(打招呼)")
-                r = reply_card(mid, _welcome(user_open_id or ""))
-                if r and r.get("code") != 0:
-                    _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
-                return
-            if _greeting in ("你可以做什么", "你能做什么", "你能干嘛", "有什么功能", "介绍下自己", "你是谁"):
-                _log("发送欢迎卡片(你能做什么)")
-                r = reply_card(mid, _welcome(user_open_id or ""))
-                if r and r.get("code") != 0:
-                    _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
-                return
+def _process_message(mid: str, text: str, user_open_id: Optional[str]):
+    try:
+        t = (text or "").strip()
 
-            # ── 最近动态（跨 Bot 活动汇总）──
-            if _greeting in ("最近动态", "动态", "团队动态", "bot动态"):
-                _log("查询最近动态")
-                try:
-                    from core.events import scan as _scan_events
-                    events = _scan_events(hours=48)
-                    if not events:
-                        reply_card(mid, make_card("最近动态", [{"text": "过去 48 小时没有 bot 活动记录。"}], color="blue"))
-                    else:
-                        lines = [f"**过去 48 小时共 {len(events)} 条动态：**\n"]
-                        for e in events[-20:]:
-                            ts_short = e.get("ts", "")[-14:-6]
-                            bot = e.get("bot", "?")
-                            summary = e.get("summary", "")
-                            topic = (e.get("meta") or {}).get("topic", "")
-                            line = f"[{ts_short}] **{bot}** · {summary}"
-                            if topic and topic not in summary:
-                                line += f"（{topic[:30]}）"
-                            lines.append(line)
-                        reply_card(mid, make_card("最近动态", [{"text": "\n".join(lines)}], color="blue"))
-                except Exception as _e:
-                    _log(f"查询动态失败: {_e}")
-                    reply_message(mid, "查询动态时出错，请稍后再试。")
-                return
+        # 帮助
+        if t.lower() in ("帮助", "help", "?", "？"):
+            reply_card(mid, _help())
+            return
 
-            # ── 团队指令 ──────────────────────────────────────
-            _team_result = _handle_team_command(t, user_open_id or "", mid)
-            if _team_result:
-                return
+        # 打招呼 / 问「你能做什么」→ 直接回欢迎卡片（否则会走聊天只回文字）
+        _greeting = t.lower().strip()
+        if _greeting in ("hi", "hello", "你好", "嗨", "在吗", "在么", "hey"):
+            _log("发送欢迎卡片(打招呼)")
+            r = reply_card(mid, _welcome(user_open_id or ""))
+            if r and r.get("code") != 0:
+                _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
+            return
+        if _greeting in ("你可以做什么", "你能做什么", "你能干嘛", "有什么功能", "介绍下自己", "你是谁"):
+            _log("发送欢迎卡片(你能做什么)")
+            r = reply_card(mid, _welcome(user_open_id or ""))
+            if r and r.get("code") != 0:
+                _log(f"回复欢迎卡片失败: code={r.get('code')} msg={r.get('msg')}")
+            return
 
-            # ── 当前团队码（用于 Bitable 多租户隔离）──
-            _current_team_code = ""
-            if user_open_id:
-                try:
-                    from core.team import get_current_team as _gct
-                    _ct = _gct(user_open_id)
-                    if _ct:
-                        _current_team_code = _ct.get("code", "")
-                except Exception:
-                    pass
-
-            # ── 等待输入状态处理（多步流程）──
-            _user_key = user_open_id or mid
-            _ps = _get_pending(_user_key)
-            if _ps:
-                if t.lower() in ("取消", "cancel", "算了"):
-                    _clear_pending(_user_key)
-                    reply_message(mid, "已取消。")
-                    return
-
-                if _ps["type"] == "awaiting_budget_items":
-                    proj_name = _ps.get("project", "")
-                    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-                    budget_items = []
-                    for ln in lines:
-                        ln = re.sub(r"^[\d.、)）]\s*", "", ln)
-                        parts = re.split(r"\s+", ln.strip(), maxsplit=1)
-                        if len(parts) == 2:
-                            cat, amt_str = parts
-                            try:
-                                amt = float(amt_str.replace(",", "").replace("¥", "").replace("￥", ""))
-                                budget_items.append({"name": cat, "category": cat, "budget": amt})
-                            except ValueError:
-                                budget_items.append({"name": ln, "category": "其他", "budget": 0})
-                        elif len(parts) == 1:
-                            budget_items.append({"name": parts[0], "category": parts[0], "budget": 0})
-
-                    if not budget_items:
-                        reply_message(mid, "格式不太对，请每行输入「类别 金额」，例如：营销 50000\n或发「取消」跳过。")
-                        return
-
-                    _clear_pending(_user_key)
-                    from memo.finance import create_budget as fin_create_budget
-                    budget = fin_create_budget(proj_name, budget_items, team_code=_current_team_code)
-                    total = budget.get("total_budget", 0)
-                    item_lines = [f"- {it['name']}: ¥{it['budget']:,.0f}" for it in budget_items]
-                    reply_card(mid, action_card(
-                        f"💰 预算已创建 — {proj_name}",
-                        f"总预算 **¥{total:,.0f}**\n\n" + "\n".join(item_lines),
-                        hints=[f"「记账 描述 金额 #{proj_name}」记账", f"「{proj_name} 预算」查看预算执行"],
-                        color="green",
-                    ))
-                    return
-
-                if _ps["type"] == "awaiting_goal":
-                    proj_name = _ps.get("project", "")
-                    _clear_pending(_user_key)
-                    from memo.finance import add_goal as fin_add_goal
-                    goal = fin_add_goal(proj_name, t, "100", "%", team_code=_current_team_code)
-                    reply_card(mid, action_card(
-                        f"🎯 目标已创建 — {proj_name}",
-                        f"**{t}**（目标 100%）",
-                        hints=[f"「更新目标 {t[:10]} 50」更新进度", f"「{proj_name} 总览」查看项目全貌"],
-                        color="green",
-                    ))
-                    return
-
-                if _ps["type"] == "awaiting_expense_project":
-                    _clear_pending(_user_key)
-                    desc = _ps.get("description", "")
-                    amt = _ps.get("amount", 0)
-                    exp_type = _ps.get("expense_type", "支出")
-                    cat = _ps.get("category", "其他")
-                    proj_tag = ""
-                    if t.lower() not in ("确认", "ok", "跳过", "不归入"):
-                        proj_tag = t.strip().lstrip("#")
-                    record = add_expense(
-                        amount=amt, description=desc, category=cat,
-                        expense_type=exp_type, project=proj_tag,
-                        user_open_id=user_open_id or "",
-                        team_code=_current_team_code,
-                    )
-                    tag_info = f"　#{proj_tag}" if proj_tag else ""
-                    reply_card(mid, action_card(
-                        f"✅ 已记账",
-                        f"**{exp_type}** ¥{amt:,.2f} — {desc}{tag_info}\n日期：{record['date']}",
-                        hints=["「本月花费」查看月度汇总", "「预算概览 项目名」查预算"],
-                        color="green",
-                    ))
-                    return
-
-            # ── 关键词快速匹配：备忘 ──
-            prefixes = (
-                "备忘 ", "备忘：", "备忘:", "记一下 ", "记一下：", "记一下:",
-                "别忘了 ", "别忘了：", "别忘了:", "任务 ", "任务：", "任务:",
-                "待办 ", "待办：", "待办:",
-            )
-            for prefix in prefixes:
-                if t.startswith(prefix):
-                    raw_content = t[len(prefix):].strip()
-                    if not raw_content:
-                        reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
-                        return
-                    items = _split_multi_memos(raw_content)
-                    if len(items) > 1:
-                        saved = []
-                        has_claude = False
-                        for item in items:
-                            c, cat, th, asn = _parse_memo_with_thread(item)
-                            if c:
-                                new_id = store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th, assignee=asn)
-                                _auto_append_board(th, c, assignee=asn, memo_id=new_id)
-                                tag = f" #{th}" if th else ""
-                                claude_tag = " 🤖" if asn == "claude" else ""
-                                saved.append(f"- {c[:60]}{tag}{claude_tag}")
-                                if asn == "claude":
-                                    has_claude = True
-                        if saved:
-                            title = f"📝 已记下 {len(saved)} 条备忘"
-                            hints = ["发「线程」查看工作线程", "发「备忘列表」查看全部"]
-                            if has_claude:
-                                hints.insert(0, "🤖 标记的任务将由 Claude 处理")
-                            reply_card(mid, action_card(title, "\n".join(saved), hints=hints, color="green"))
-                            _log(f"备忘(多条拆分): {len(saved)} 条")
-                        return
-                    content, category, thread, assignee = _parse_memo_with_thread(raw_content)
-                    if not content:
-                        reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
-                        return
-                    new_id = store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread, assignee=assignee)
-                    _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
-                    tag_hint = ""
-                    if thread:
-                        tag_hint = f" #{thread}"
-                    elif category:
-                        tag_hint = f"（{MEMO_CATEGORY_DISPLAY.get(category, category)}）"
-                    if assignee == "claude":
-                        reply_card(mid, action_card(
-                            f"🤖 已记下，将由 Claude 处理{tag_hint}",
-                            f"**{content[:100]}**",
-                            hints=["Claude 会自动拾取并执行此任务", "完成后会推送结果到飞书"],
-                            color="purple",
-                        ))
-                    else:
-                        reply_card(mid, action_card(
-                            f"📝 已记下备忘{tag_hint}",
-                            f"**{content[:100]}**",
-                            hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
-                            color="green",
-                        ))
-                    _log(f"备忘(关键词): 已写入 thread={thread} assignee={assignee}")
-                    return
-
-            if t.lower().startswith("todo ") or t.lower().startswith("todo:"):
-                raw_content = t[5:].lstrip(" :").strip()
-                if raw_content:
-                    content, category, thread, assignee = _parse_memo_with_thread(raw_content)
-                    new_id = store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread, assignee=assignee)
-                    _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
-                    tag_hint = f" #{thread}" if thread else ""
-                    reply_card(mid, action_card(
-                        f"📝 已记下备忘{tag_hint}",
-                        f"**{content[:100]}**",
-                        hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
-                        color="green",
-                    ))
-                    _log(f"todo(关键词): 已写入 thread={thread}")
-                    return
-
-            if t in ("备忘", "记一下", "别忘了", "任务", "待办"):
-                reply_message(mid, "请说「备忘 具体内容」或「任务 具体内容」～")
-                return
-
-            # ── 完成备忘 ──
-            _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-            def _cn2int(s: str) -> Optional[int]:
-                s = s.strip()
-                if s.isdigit():
-                    return int(s)
-                if s in _CN_NUM:
-                    return _CN_NUM[s]
-                if s.startswith("十") and len(s) == 2 and s[1] in _CN_NUM:
-                    return 10 + _CN_NUM[s[1]]
-                return None
-
-            _done_prefix = r"(完成|done|搞定|✅|做完了|标记完成|已完成|办好了|弄好了)"
-
-            # 批量完成：「完成 1、2、3」「完成 1,2,3,4,5」「完成 1 2 3」（允许末尾逗号）
-            m_done_batch = re.match(
-                rf"^{_done_prefix}\s*((?:\d+[\s,，、]*)+)\s*$", t, re.IGNORECASE
-            )
-            if m_done_batch and len(re.findall(r"\d+", m_done_batch.group(2))) >= 2:
-                raw_nums = m_done_batch.group(2)
-                indices = sorted(set(int(x) for x in re.findall(r"\d+", raw_nums)), reverse=True)
-                results = []
-                for idx in indices:
-                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
-                    results.append(msg_text)
-                results.reverse()
-                reply_message(mid, "\n".join(results))
-                return
-
-            m_done = re.match(
-                rf"^{_done_prefix}\s*第?\s*(\d+)\s*条?\s*$", t, re.IGNORECASE
-            )
-            if m_done:
-                idx = int(m_done.group(2))
-                ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
-                reply_message(mid, msg_text)
-                return
-
-            m_done_cn = re.match(
-                rf"^{_done_prefix}\s*第?\s*([一二三四五六七八九十]+)\s*条?\s*$", t, re.IGNORECASE
-            )
-            if m_done_cn:
-                idx = _cn2int(m_done_cn.group(2))
-                if idx:
-                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-
-            m_done_rev = re.match(
-                r"^第\s*(\d+|[一二三四五六七八九十]+)\s*条?\s*(完成|搞定|做完了|办好了|弄好了)\s*$", t
-            )
-            if m_done_rev:
-                idx = _cn2int(m_done_rev.group(1))
-                if idx:
-                    ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-
-            m_done_kw = re.match(
-                rf"^{_done_prefix}\s*[：:]?\s*(.+)$", t, re.IGNORECASE
-            )
-            if m_done_kw:
-                keyword = m_done_kw.group(2).strip()
-                if not keyword.isdigit() and keyword not in _CN_NUM:
-                    ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-
-            # ── 清除/删除备忘 ──
-            _del_idx = None
-            m_clear = re.match(
-                r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*第?\s*(\d+)\s*条?\s*$", t
-            )
-            if m_clear:
-                _del_idx = m_clear.group(2)
-            if not _del_idx:
-                m_clear2 = re.match(
-                    r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*[：:]\s*(\d+)\s*$", t
-                )
-                if m_clear2:
-                    _del_idx = m_clear2.group(2)
-            if not _del_idx:
-                m_clear3 = re.match(r"^第\s*(\d+)\s*条?\s*(删掉|删除|移除|去掉)\s*$", t)
-                if m_clear3:
-                    _del_idx = m_clear3.group(1)
-            if _del_idx:
-                try:
-                    idx = int(_del_idx)
-                    ok, msg_text = store_delete_memo_by_index(idx, user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-                except ValueError:
-                    pass
-
-            m_clear_kw = re.match(
-                r"^(清除备忘|删除备忘|删掉备忘|删掉|删除|移除|去掉)\s*[：:]?\s*(.+)$", t
-            )
-            if m_clear_kw:
-                keyword = m_clear_kw.group(2).strip()
-                if not keyword.isdigit():
-                    ok, msg_text = store_delete_memo_by_content(keyword, user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-
-            # ── 设置分类 ──
-            m_set_cat = (
-                re.match(r"^(?:把)?第\s*(\d+)\s*条\s*(?:标成|设为|标为)\s*(日常|灵感|要事)\s*$", t)
-                or re.match(r"^(日常|灵感|要事)\s*[：:]\s*第\s*(\d+)\s*条\s*$", t)
-            )
-            if m_set_cat:
-                if m_set_cat.lastindex == 2 and m_set_cat.group(1).isdigit():
-                    idx, cat = int(m_set_cat.group(1)), m_set_cat.group(2)
+        # ── 最近动态（跨 Bot 活动汇总）──
+        if _greeting in ("最近动态", "动态", "团队动态", "bot动态"):
+            _log("查询最近动态")
+            try:
+                from core.events import scan as _scan_events
+                events = _scan_events(hours=48)
+                if not events:
+                    reply_card(mid, make_card("最近动态", [{"text": "过去 48 小时没有 bot 活动记录。"}], color="blue"))
                 else:
-                    cat, idx = m_set_cat.group(1), int(m_set_cat.group(2))
-                ok, msg_text = store_set_memo_category_by_index(idx, cat, user_open_id=user_open_id)
-                reply_message(mid, msg_text)
+                    lines = [f"**过去 48 小时共 {len(events)} 条动态：**\n"]
+                    for e in events[-20:]:
+                        ts_short = e.get("ts", "")[-14:-6]
+                        bot = e.get("bot", "?")
+                        summary = e.get("summary", "")
+                        topic = (e.get("meta") or {}).get("topic", "")
+                        line = f"[{ts_short}] **{bot}** · {summary}"
+                        if topic and topic not in summary:
+                            line += f"（{topic[:30]}）"
+                        lines.append(line)
+                    reply_card(mid, make_card("最近动态", [{"text": "\n".join(lines)}], color="blue"))
+            except Exception as _e:
+                _log(f"查询动态失败: {_e}")
+                reply_message(mid, "查询动态时出错，请稍后再试。")
+            return
+
+        # ── 团队指令 ──────────────────────────────────────
+        _team_result = _handle_team_command(t, user_open_id or "", mid)
+        if _team_result:
+            return
+
+        # ── 当前团队码（用于 Bitable 多租户隔离）──
+        _current_team_code = ""
+        if user_open_id:
+            try:
+                from core.team import get_current_team as _gct
+                _ct = _gct(user_open_id)
+                if _ct:
+                    _current_team_code = _ct.get("code", "")
+            except Exception:
+                pass
+
+        # ── 等待输入状态处理（多步流程）──
+        _user_key = user_open_id or mid
+        _ps = _get_pending(_user_key)
+        if _ps:
+            if t.lower() in ("取消", "cancel", "算了"):
+                _clear_pending(_user_key)
+                reply_message(mid, "已取消。")
                 return
 
-            # ── 意图解析 ──
-            _log("解析意图...")
-            intent = parse_intent(text)
-            action = intent.get("action", "chat")
-            params = intent.get("params") or {}
-            reply = intent.get("reply") or ""
-            _log(f"意图: action={action}")
+            if _ps["type"] == "awaiting_budget_items":
+                proj_name = _ps.get("project", "")
+                lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+                budget_items = []
+                for ln in lines:
+                    ln = re.sub(r"^[\d.、)）]\s*", "", ln)
+                    parts = re.split(r"\s+", ln.strip(), maxsplit=1)
+                    if len(parts) == 2:
+                        cat, amt_str = parts
+                        try:
+                            amt = float(amt_str.replace(",", "").replace("¥", "").replace("￥", ""))
+                            budget_items.append({"name": cat, "category": cat, "budget": amt})
+                        except ValueError:
+                            budget_items.append({"name": ln, "category": "其他", "budget": 0})
+                    elif len(parts) == 1:
+                        budget_items.append({"name": parts[0], "category": parts[0], "budget": 0})
 
-            # ── 加日历 ──
-            if action == "add_calendar" and user_open_id:
-                title = params.get("title") or "日程"
-                start_time = params.get("start_time") or ""
-                end_time = params.get("end_time") or ""
-                if not start_time or not end_time:
-                    reply_message(mid, "加日历需要明确开始和结束时间，请再说清楚一点～")
-                    return
-                cal_token_create = get_user_access_token("calendar_create")
-                cal_id = (os.environ.get("FEISHU_CALENDAR_ID") or "").strip()
-                if not cal_id:
-                    cal_token_get = get_user_access_token("calendar_get")
-                    cal_id = get_primary_calendar_id(user_open_id, user_access_token=cal_token_get)
-                if not cal_id:
-                    reply_message(mid, "无法获取你的日历，请配置 FEISHU_TOKEN_CALENDAR_GET 后重试。")
-                    return
-                ok, msg_text = create_calendar_event(
-                    cal_id, title, start_time, end_time,
-                    params.get("description") or "",
-                    user_access_token=cal_token_create,
-                )
-                if not ok and ("access_role" in msg_text.lower() or "no calendar" in msg_text.lower()) and not cal_token_create:
-                    msg_text = "往你的个人日历里加日程需要「用户身份」授权。请在 .env 中配置 FEISHU_TOKEN_CALENDAR_CREATE 后再试。"
-                reply_message(mid, msg_text)
-                return
-
-            # ── 备忘相关 ──
-            if action in ("add_todo", "add_task"):
-                content = (params.get("title") or params.get("summary") or params.get("content") or text).strip()
-                for prefix in ("待办 ", "待办：", "待办:", "任务 ", "任务：", "任务:", "todo "):
-                    if content.lower().startswith(prefix) or content.startswith(prefix):
-                        content = content[len(prefix):].strip()
-                        break
-                store_add_memo(content or "未命名", user_open_id=user_open_id)
-                reply_message(mid, "已记下备忘～")
-                return
-
-            if action in ("add_memo", "add_memos"):
-                raw = params.get("content") or text.strip()
-                items_from_llm = params.get("items")
-                if isinstance(items_from_llm, list) and len(items_from_llm) > 1:
-                    memo_items = items_from_llm
-                else:
-                    memo_items = _split_multi_memos(raw)
-
-                if len(memo_items) > 1:
-                    saved = []
-                    has_claude = False
-                    for item in memo_items:
-                        c, cat, th, asn = _parse_memo_with_thread(item.strip() if isinstance(item, str) else str(item))
-                        if c:
-                            new_id = store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th, assignee=asn)
-                            _auto_append_board(th, c, assignee=asn, memo_id=new_id)
-                            tag = f" #{th}" if th else ""
-                            claude_tag = " 🤖" if asn == "claude" else ""
-                            saved.append(f"- {c[:60]}{tag}{claude_tag}")
-                            if asn == "claude":
-                                has_claude = True
-                    if saved:
-                        hints = ["发「线程」查看工作线程", "发「备忘列表」查看全部"]
-                        if has_claude:
-                            hints.insert(0, "🤖 标记的任务将由 Claude 处理")
-                        reply_card(mid, action_card(
-                            f"📝 已记下 {len(saved)} 条备忘",
-                            "\n".join(saved),
-                            hints=hints, color="green",
-                        ))
-                    else:
-                        reply_message(mid, "请说一下要记的备忘内容～")
+                if not budget_items:
+                    reply_message(mid, "格式不太对，请每行输入「类别 金额」，例如：营销 50000\n或发「取消」跳过。")
                     return
 
-                content, category, thread, assignee = _parse_memo_with_thread(raw)
-                if not content:
-                    reply_message(mid, "请说一下要记的备忘内容～")
-                    return
-                if not thread:
-                    thread = (params.get("thread") or "").strip()
-                reminder = (params.get("reminder_date") or "").strip() or None
-                new_id = store_add_memo(content, user_open_id=user_open_id, reminder_date=reminder, category=category, thread=thread, assignee=assignee)
-                _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
-                tag_hint = f" #{thread}" if thread else ""
-                date_hint = f"（提醒：{reminder}）" if reminder else ""
-                if assignee == "claude":
-                    reply_card(mid, action_card(
-                        f"🤖 已记下，将由 Claude 处理{tag_hint}",
-                        f"**{content[:100]}**{date_hint}",
-                        hints=["Claude 会自动拾取并执行此任务", "完成后会推送结果到飞书"],
-                        color="purple",
-                    ))
-                else:
-                    reply_message(mid, f"已记下备忘～{tag_hint}{date_hint}")
-                return
-
-            if action == "list_memos":
-                thread_filter = params.get("thread", "")
-                memos = store_list_memos(
-                    limit=50, user_open_id=user_open_id,
-                    thread=thread_filter or None, include_done=False,
-                )
-                if not memos:
-                    reply_card(mid, action_card("📋 暂无未完成的备忘", hints=["发「备忘 内容」开始记"], color="blue"))
-                    return
-                lines = []
-                for i, m in enumerate(memos, 1):
-                    thread = m.get("thread") or ""
-                    tag = f"[#{thread}] " if thread else ""
-                    lines.append(f"{i}. {tag}{m.get('content', '')}")
+                _clear_pending(_user_key)
+                from memo.finance import create_budget as fin_create_budget
+                budget = fin_create_budget(proj_name, budget_items, team_code=_current_team_code)
+                total = budget.get("total_budget", 0)
+                item_lines = [f"- {it['name']}: ¥{it['budget']:,.0f}" for it in budget_items]
                 reply_card(mid, action_card(
-                    f"📋 待办列表（{len(memos)} 条未完成）",
-                    "\n".join(lines)[:2000],
-                    hints=["「完成 3」或「完成 1,2,3」批量完成", "「删除 3」删除", "「线程」看工作线"],
-                    color="blue",
+                    f"💰 预算已创建 — {proj_name}",
+                    f"总预算 **¥{total:,.0f}**\n\n" + "\n".join(item_lines),
+                    hints=[f"「记账 描述 金额 #{proj_name}」记账", f"「{proj_name} 预算」查看预算执行"],
+                    color="green",
                 ))
                 return
 
-            if action == "list_tasks":
-                memos = store_list_memos(limit=10, user_open_id=user_open_id)
-                if not memos:
-                    reply_message(mid, "暂无未完成的备忘。")
-                    return
-                lines = ["未完成备忘（「完成 序号」标记完成）："]
-                for i, m in enumerate(memos, 1):
-                    thread = m.get("thread") or ""
-                    tag = f"[#{thread}] " if thread else ""
-                    lines.append(f"{i}. {tag}{m.get('content', '')}")
-                reply_message(mid, "\n".join(lines)[:2000])
-                return
-
-            if action == "list_all_memos":
-                memos = store_list_memos(limit=200, user_open_id=user_open_id, include_done=True)
-                if not memos:
-                    reply_message(mid, "暂无备忘。")
-                    return
-                lines = [f"所有备忘（共 {len(memos)} 条，含已完成）："]
-                for i, m in enumerate(memos, 1):
-                    thread = m.get("thread") or ""
-                    tag = f"[#{thread}] " if thread else ""
-                    done = "✅ " if m.get("done") else ""
-                    lines.append(f"{i}. {done}{tag}{m.get('content', '')}")
-                reply_message(mid, "\n".join(lines)[:4000])
-                return
-
-            if action == "list_memos_by_category":
-                cat = (params.get("category") or "").strip()
-                memos = store_list_memos(limit=200, user_open_id=user_open_id, category=cat)
-                if not memos:
-                    reply_message(mid, f"暂无「{cat}」类备忘。")
-                    return
-                lines = [f"「{cat}」类备忘（共 {len(memos)} 条）："]
-                for i, m in enumerate(memos, 1):
-                    lines.append(f"{i}. {m.get('content', '')}")
-                reply_message(mid, "\n".join(lines)[:4000])
-                return
-
-            if action == "set_memo_category":
-                idx = params.get("index") or params.get("序号")
-                cat = (params.get("category") or params.get("分类") or "").strip()
-                if not idx or not cat:
-                    reply_message(mid, "请说「第3条标成灵感」或「把第2条设为要事」。")
-                    return
-                try:
-                    num = int(idx)
-                except (TypeError, ValueError):
-                    reply_message(mid, "序号需为数字。")
-                    return
-                ok, msg_text = store_set_memo_category_by_index(num, cat, user_open_id=user_open_id)
-                reply_message(mid, msg_text)
-                return
-
-            if action == "delete_memo":
-                idx = params.get("index") or params.get("序号")
-                keyword = params.get("keyword", "")
-                if idx is not None:
-                    try:
-                        num = int(idx)
-                        ok, msg_text = store_delete_memo_by_index(num, user_open_id=user_open_id)
-                        reply_message(mid, msg_text)
-                        return
-                    except (TypeError, ValueError):
-                        pass
-                if keyword:
-                    ok, msg_text = store_delete_memo_by_content(str(keyword), user_open_id=user_open_id)
-                    reply_message(mid, msg_text)
-                    return
-                reply_message(mid, "请说「删除 序号」或「删除 关键词」，例如：删除 3 / 删掉 买牛奶")
-                return
-
-            if action == "complete_memo":
-                idx = params.get("index")
-                keyword = params.get("keyword", "")
-                if idx is not None:
-                    try:
-                        ok, msg_text = store_complete_by_index(int(idx), user_open_id=user_open_id)
-                    except (ValueError, TypeError):
-                        ok, msg_text = False, "序号需为数字，例如：完成 3"
-                elif keyword:
-                    ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
-                else:
-                    ok, msg_text = False, "请说「完成 3」（按序号）或「完成 买牛奶」（按内容）"
-                reply_message(mid, msg_text)
-                return
-
-            if action == "complete_task":
-                reply_message(mid, "请用「完成 序号」或「完成 关键词」来标记备忘完成～")
-                return
-
-            # ── 线程相关 ──
-            if action == "list_threads":
-                threads = store_list_threads(user_open_id=user_open_id)
-                if not threads:
-                    reply_card(mid, action_card("📂 暂无工作线程", "发备忘时加 #标签 即可创建线程\n例如：备忘 完成 deck #creator", color="blue"))
-                    return
-                total_pending = sum(info.get("pending", 0) for info in threads)
-                lines = []
-                for info in threads:
-                    t = info["thread"]
-                    latest = info.get("latest_content", "")[:30]
-                    pending = info.get("pending", 0)
-                    done = info.get("done", 0)
-                    suffix = f"{'…' if len(info.get('latest_content', '')) > 30 else ''}"
-                    if done > 0:
-                        lines.append(f"**#{t}** ({pending}条待办 / {done}条已完成) — {latest}{suffix}")
-                    else:
-                        lines.append(f"**#{t}** ({pending}条待办) — {latest}{suffix}")
+            if _ps["type"] == "awaiting_goal":
+                proj_name = _ps.get("project", "")
+                _clear_pending(_user_key)
+                from memo.finance import add_goal as fin_add_goal
+                goal = fin_add_goal(proj_name, t, "100", "%", team_code=_current_team_code)
                 reply_card(mid, action_card(
-                    f"📂 工作线程（{len(threads)} 个 · {total_pending} 条待办）",
-                    "\n".join(lines)[:2000],
-                    hints=["「#creator进展」查某条线", "「哪条线最久没动」查沉寂"],
-                    color="blue",
+                    f"🎯 目标已创建 — {proj_name}",
+                    f"**{t}**（目标 100%）",
+                    hints=[f"「更新目标 {t[:10]} 50」更新进度", f"「{proj_name} 总览」查看项目全貌"],
+                    color="green",
                 ))
                 return
 
-            if action == "thread_progress":
-                thread_name = (params.get("thread") or "").strip()
-                if not thread_name:
-                    reply_message(mid, "请说线程名，例如「#creator进展」。")
-                    return
-                memos = store_list_memos(thread=thread_name, user_open_id=user_open_id, limit=10)
-                if not memos:
-                    reply_message(mid, f"#{thread_name} 暂无备忘。")
-                    return
-                lines = [f"**#{thread_name}** 最近动态（{len(memos)} 条）：\n"]
-                for i, m in enumerate(memos, 1):
-                    date = (m.get("created_at") or "")[:10]
-                    lines.append(f"{i}. [{date}] {m.get('content', '')}")
-                reply_card(mid, action_card(
-                    f"📌 #{thread_name} 进展",
-                    "\n".join(lines)[:2000],
-                    hints=["「线程」看所有线程", f"「备忘 xxx #{thread_name}」继续记"],
-                    color="indigo",
-                ))
-                return
-
-            if action == "stale_threads":
-                summary = store_thread_summary(user_open_id=user_open_id, days=7)
-                stale = summary.get("stale", [])
-                if not stale:
-                    reply_message(mid, "所有线程本周都有动态，没有沉寂的 👍")
-                    return
-                lines = ["本周没有新备忘的线程：\n"]
-                for s in stale[:8]:
-                    lines.append(f"💤 **#{s['thread']}** — {s['days_silent']}天没动了（共{s['total']}条备忘）")
-                reply_card(mid, action_card(
-                    "💤 沉寂线程",
-                    "\n".join(lines)[:2000],
-                    hints=["发「#xxx进展」查某条线详情"],
-                    color="yellow",
-                ))
-                return
-
-            if action == "weekly_report":
-                summary = store_thread_summary(user_open_id=user_open_id, days=7)
-                active = summary.get("active", {})
-                stale = summary.get("stale", [])
-                lines = ["📊 **本周工作线程概览**\n"]
-                if active:
-                    lines.append("🔥 **活跃**")
-                    for t, info in sorted(active.items(), key=lambda x: x[1]["count"], reverse=True):
-                        if t == "(未分类)":
-                            continue
-                        preview = "、".join(info["items"][:2])
-                        lines.append(f"  **#{t}** ({info['count']}条) — {preview}")
-                    uncat = active.get("(未分类)")
-                    if uncat:
-                        lines.append(f"  _(未分类 {uncat['count']}条)_")
-                if stale:
-                    lines.append("\n💤 **沉寂**")
-                    for s in stale[:5]:
-                        lines.append(f"  **#{s['thread']}** — {s['days_silent']}天没动")
-                if not active and not stale:
-                    lines.append("本周暂无备忘记录。")
-                reply_card(mid, action_card(
-                    "📊 周报",
-                    "\n".join(lines)[:2000],
-                    hints=["「#xxx进展」查某条线", "「线程」查所有"],
-                    color="indigo",
-                ))
-                return
-
-            # ── 月报 ──
-            if action == "monthly_report":
-                month = (params.get("month") or "").strip()
-                reply_card(mid, progress_card("正在生成月报", f"AI 汇总线程+项目+财务…", color="indigo"))
-                try:
-                    from cal.daily_brief import generate_monthly_report
-                    report = generate_monthly_report(month=month, user_open_id=user_open_id)
-                    if not report:
-                        report = "暂无足够数据生成月报。"
-                    if len(report) > 3500:
-                        parts = [report[i:i+3500] for i in range(0, len(report), 3500)]
-                        for i, part in enumerate(parts):
-                            title = "📊 月度报告" if i == 0 else f"📊 月度报告（续 {i+1}）"
-                            reply_card(mid, action_card(title, part, color="indigo"))
-                    else:
-                        reply_card(mid, action_card("📊 月度报告", report, color="indigo"))
-                except Exception as e:
-                    _log(f"月报生成失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("月报生成失败", "生成失败，请稍后重试。"))
-                return
-
-            # ── 翻译 & 英文写作 ──
-            if action == "translate":
-                content = (params.get("content") or text).strip()
-                if not content:
-                    reply_message(mid, "请说要翻译的内容，例如：翻译 我们希望在Q2完成优化")
-                    return
-                target_lang = (params.get("target_lang") or "").strip()
-                scene = (params.get("scene") or "").strip()
-                mode = (params.get("mode") or "translate").strip()
-                _log(f"翻译请求: mode={mode} target_lang={target_lang} scene={scene} content_len={len(content)}")
-                try:
-                    if mode == "compose":
-                        from skills.translation import COMPOSE_SYSTEM_PROMPT
-                        system = COMPOSE_SYSTEM_PROMPT
-                    else:
-                        from skills.translation import TRANSLATE_SYSTEM_PROMPT
-                        system = TRANSLATE_SYSTEM_PROMPT
-
-                    user_parts = []
-                    if target_lang:
-                        lang_label = "英文" if target_lang == "en" else "中文"
-                        user_parts.append(f"目标语言：{lang_label}")
-                    if scene:
-                        user_parts.append(f"使用场景：{scene}")
-                    user_parts.append(f"\n{content}")
-                    user_prompt = "\n".join(user_parts)
-
-                    provider = (os.environ.get("TRANSLATE_PROVIDER") or "deepseek").strip().lower()
-                    _log(f"翻译 provider={provider}")
-                    result = chat_completion(
-                        provider=provider,
-                        system=system,
-                        user=user_prompt,
-                        temperature=0.4,
-                    )
-                    if not result:
-                        _log("翻译返回空结果")
-                        reply_card(mid, error_card("翻译失败", "模型返回了空结果，请稍后重试。"))
-                        return
-
-                    card_title = "✍️ 英文写作" if mode == "compose" else "🌐 翻译结果"
-                    if len(result) > 3500:
-                        parts = [result[i:i+3500] for i in range(0, len(result), 3500)]
-                        for i, part in enumerate(parts):
-                            title = card_title if i == 0 else f"{card_title}（续 {i+1}）"
-                            reply_card(mid, action_card(title, part, color="blue"))
-                    else:
-                        reply_card(mid, action_card(card_title, result, color="blue"))
-                    _log(f"翻译完成: mode={mode} result_len={len(result)}")
-                except Exception as e:
-                    _log(f"翻译失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card(
-                        "翻译失败",
-                        f"请稍后重试。\n\n_(debug: {type(e).__name__}: {str(e)[:100]})_",
-                    ))
-                return
-
-            # ── 联网研究 ──
-            if action == "research":
-                topic = (params.get("topic") or text).strip()
-                if not topic:
-                    reply_message(mid, "请说要研究什么，例如：研究 Character.ai 增长机制")
-                    return
-                reply_card(mid, progress_card(
-                    "正在研究",
-                    f"**课题：**{topic[:100]}\n\n"
-                    "正在多来源搜索、交叉验证、分析机制……\n"
-                    "预计 1–3 分钟，完成后发送完整报告。",
-                    color="indigo",
-                ))
-                try:
-                    from research.researcher import Researcher
-                    researcher = Researcher()
-                    report = researcher.research(topic, verbose=False)
-                except Exception as e:
-                    _log(f"研究失败: {e}\n{traceback.format_exc()}")
-                    if user_open_id:
-                        send_card_to_user(user_open_id, error_card(
-                            "研究失败", "生成失败，请稍后重试。",
-                            suggestions=["换个说法重试", "发「帮助」查看指令"],
-                        ))
-                    return
-
-                _send_research_report(mid, user_open_id, topic, report)
-                return
-
-            # ── 导出线程看板 ──
-            if action == "export_board":
-                thread_filter = (params.get("thread") or "").strip()
-                title = f"📋 线程看板 — #{thread_filter}" if thread_filter else "📋 线程看板"
-                reply_card(mid, progress_card("正在生成看板", title, color="blue"))
-                try:
-                    ok_b, url_or_err, board_stats = bitable_refresh_board(
-                        user_open_id=user_open_id,
-                        thread=thread_filter or None,
-                    )
-                    if not ok_b:
-                        _log(f"看板刷新失败: {url_or_err}")
-                        reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
-                        return
-
-                    if not board_stats or sum(board_stats.values()) == 0:
-                        hint = f"线程 #{thread_filter} 下没有备忘" if thread_filter else "还没有备忘数据"
-                        reply_card(mid, action_card("📋 看板为空", hint,
-                            hints=["发「备忘 xxx #线程」添加内容", "发「线程」查看现有线程"],
-                            color="blue"))
-                        return
-
-                    board_url = url_or_err or get_bitable_board_url()
-                    _stats_line = (
-                        f"今日新增 {board_stats.get('today', 0)} 条 | "
-                        f"本周进行中 {board_stats.get('week', 0)} 条 | "
-                        f"等待跟进 {board_stats.get('stale', 0)} 条 | "
-                        f"已完成 {board_stats.get('done', 0)} 条"
-                    )
-
-                    reply_card(mid, action_card(
-                        "📋 线程看板已刷新",
-                        f"**{title}**\n\n"
-                        f"[点击打开看板]({board_url})\n\n"
-                        f"{_stats_line}"
-                        + ("\n\n新增备忘会自动追加到此看板" if thread_filter else ""),
-                        hints=["数据来自你的备忘，可在飞书中编辑", "再发「看板」可刷新"],
-                        color="green",
-                    ))
-                except Exception as e:
-                    _log(f"生成线程看板失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
-                return
-
-            # ── 创建项目 ──
-            if action == "create_project":
-                proj_name = (params.get("name") or "").strip()
-                if not proj_name:
-                    reply_message(mid, "请说项目名称，例如：创建项目 Q2营销")
-                    return
-                existing = find_project(proj_name)
-                if existing:
-                    _url = existing.get("bitable_url") or existing.get("url", "")
-                    reply_card(mid, action_card(
-                        "📋 项目已存在",
-                        f"**{existing['name']}**\n[打开项目管理中心]({_url})",
-                        hints=[f"直接说「{existing['name']} 加任务 xxx」添加内容"],
-                        color="blue",
-                    ))
-                    return
-                reply_card(mid, progress_card("正在创建项目", f"**{proj_name}**", color="blue"))
-                try:
-                    from memo.bitable_hub import ensure_hub
-                    ensure_hub(team_code=_current_team_code)
-                    register_project(
-                        name=proj_name,
-                        spreadsheet_token="",
-                        sheet_id="",
-                        url="",
-                        created_by=user_open_id or "",
-                        team_code=_current_team_code,
-                    )
-                    proj = find_project(proj_name)
-                    hub_url = (proj or {}).get("bitable_url", "")
-                    _user_key = user_open_id or mid
-                    _set_pending(_user_key, "awaiting_budget_items", project=proj_name)
-                    reply_card(mid, action_card(
-                        "📋 项目已创建",
-                        f"**{proj_name}**\n\n"
-                        + (f"[打开项目管理中心]({hub_url})\n\n" if hub_url else "")
-                        + "**接下来设置预算**（每行：类别 金额）：\n"
-                        "> 营销 50000\n"
-                        "> 设计 10000\n"
-                        "> 差旅 5000\n\n"
-                        "直接发送预算项，或发「取消」跳过。",
-                        hints=[
-                            f"「{proj_name} 加任务 xxx」添加任务",
-                            "发飞书妙记链接可直接归档到资料库",
-                        ],
-                        color="green",
-                    ))
-                except Exception as e:
-                    _log(f"创建项目失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("创建项目失败", "操作失败，请稍后重试。"))
-                return
-
-            # ── 项目列表 ──
-            if action == "list_projects":
-                projects = store_list_projects()
-                if not projects:
-                    reply_card(mid, action_card(
-                        "📋 暂无项目",
-                        "还没有创建过项目表。",
-                        hints=["说「创建项目 xxx」开始"],
-                        color="blue",
-                    ))
-                    return
-                lines = []
-                from memo.bitable_hub import get_hub_url as _get_hub_url
-                _hub = _get_hub_url(team_code=_current_team_code)
-                for i, p in enumerate(projects, 1):
-                    _purl = p.get("bitable_url") or p.get("url", "")
-                    lines.append(f"{i}. **{p['name']}**　_{p['created_at'][:10]}_")
-                if _hub:
-                    lines.append(f"\n[打开项目管理中心]({_hub})")
-                reply_card(mid, action_card(
-                    f"📋 项目列表（{len(projects)} 个）",
-                    "\n".join(lines),
-                    hints=["「项目名 加任务 xxx」添加内容", "发妙记链接可归档到资料库"],
-                    color="blue",
-                ))
-                return
-
-            # ── 加任务到项目 ──
-            if action == "add_project_task":
-                proj_name = (params.get("project") or "").strip()
-                task_text = (params.get("task") or "").strip()
-                if not proj_name or not task_text:
-                    reply_message(mid, "格式：Q2营销 加任务 写推广方案\n或：加任务 写推广方案 到 Q2营销")
-                    return
-                proj = find_project(proj_name)
-                if not proj:
-                    reply_card(mid, error_card(
-                        "未找到项目",
-                        f"没有名为「{proj_name}」的项目",
-                        suggestions=[f"先「创建项目 {proj_name}」", "「项目列表」查看已有项目"],
-                    ))
-                    return
-                try:
-                    from memo.bitable_hub import add_task as _bt_add_task, get_hub_url
-                    assignee = ""
-                    import re as _re
-                    m_at = _re.search(r"[@＠]([\w\u4e00-\u9fff]+)", task_text)
-                    if m_at:
-                        assignee = m_at.group(1)
-                        task_text = task_text[:m_at.start()].strip()
-                    ok, msg = _bt_add_task(
-                        project=proj["name"], task=task_text,
-                        source="手动添加", assignee=assignee,
-                        team_code=_current_team_code,
-                    )
-                    hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
-                    if ok:
-                        reply_card(mid, action_card(
-                            "✅ 任务已添加",
-                            f"**{proj['name']}** ← {task_text}"
-                            + (f"\n负责人：{assignee}" if assignee else ""),
-                            hints=[f"[打开项目管理中心]({hub_url})"] if hub_url else [],
-                            color="green",
-                        ))
-                    else:
-                        _log(f"添加任务失败: {msg}")
-                        reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
-                except Exception as e:
-                    _log(f"加任务失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
-                return
-
-            # ── 导入飞书妙记 ──
-            if action == "import_minutes":
-                raw_text = params.get("text") or text
-                proj_name = (params.get("project") or "").strip()
-                token = extract_minute_token(raw_text)
-                if not token:
-                    reply_message(mid, "没有识别到妙记链接，请发送完整的飞书妙记链接。")
-                    return
-                ok, info = get_minutes_info(token)
-                if not ok:
-                    _log(f"获取妙记失败: {info}")
-                    reply_card(mid, error_card("获取妙记失败", "操作失败，请稍后重试。",
-                        suggestions=["检查链接是否正确", "确认 bot 有妙记阅读权限"]))
-                    return
-                minutes_title = info.get("title", "未知会议")
-                minutes_dur = info.get("duration", "")
-                minutes_url = info.get("url", "")
-                if not proj_name:
-                    projects = store_list_projects()
-                    if projects:
-                        proj_hints = "、".join(p["name"] for p in projects[:5])
-                        reply_card(mid, action_card(
-                            f"🎬 识别到妙记：{minutes_title}",
-                            f"时长：{minutes_dur}\n\n要归档到哪个项目？\n现有项目：{proj_hints}\n\n"
-                            f"回复：**归档到 项目名**",
-                            color="blue",
-                        ))
-                    else:
-                        reply_card(mid, action_card(
-                            f"🎬 识别到妙记：{minutes_title}",
-                            f"时长：{minutes_dur}\n\n还没有项目，先创建一个：\n**创建项目 项目名**",
-                            color="blue",
-                        ))
-                    return
-                proj = find_project(proj_name)
-                if not proj:
-                    reply_card(mid, error_card("未找到项目", f"没有「{proj_name}」",
-                        suggestions=[f"先「创建项目 {proj_name}」"]))
-                    return
-                try:
-                    from memo.bitable_hub import add_resource as _bt_add_resource, get_hub_url
-                    note = f"时长：{minutes_dur}" if minutes_dur else ""
-                    ok2, msg = _bt_add_resource(
-                        project=proj["name"],
-                        name=minutes_title,
-                        res_type="飞书妙记",
-                        link=minutes_url,
-                        source="自动记录",
-                        note=note,
-                        team_code=_current_team_code,
-                    )
-                    hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
-                    if ok2:
-                        reply_card(mid, action_card(
-                            "✅ 妙记已归档到资料库",
-                            f"**{minutes_title}** → {proj['name']}\n\n"
-                            + (f"[打开项目管理中心]({hub_url})\n\n" if hub_url else "")
-                            + "粘贴会议纪要内容，我可以自动提取 action items",
-                            color="green",
-                        ))
-                    else:
-                        _log(f"归档失败: {msg}")
-                        reply_card(mid, error_card("归档失败", "操作失败，请稍后重试。"))
-                except Exception as e:
-                    _log(f"导入妙记失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入妙记失败", "操作失败，请稍后重试。"))
-                return
-
-            # ── 导入内容到项目（LLM 通用格式识别）──
-            if action == "import_content":
-                proj_name = (params.get("project") or "").strip()
-                content = (params.get("content") or text).strip()
-                if not proj_name:
-                    projects = store_list_projects()
-                    if projects:
-                        proj_hints = "、".join(p["name"] for p in projects[:5])
-                        reply_card(mid, action_card(
-                            "📋 导入到哪个项目？",
-                            f"现有项目：{proj_hints}\n\n回复：**导入到 项目名**",
-                            hints=["或先「创建项目 xxx」新建一个"],
-                            color="blue",
-                        ))
-                    else:
-                        reply_message(mid, "还没有项目，先说「创建项目 xxx」新建一个。")
-                    return
-                if not content or len(content) < 5:
-                    reply_message(mid, "请粘贴要导入的内容（表格、列表、会议纪要、任意格式均可）。")
-                    return
-                proj = find_project(proj_name)
-                if not proj:
-                    reply_card(mid, error_card("未找到项目", f"没有「{proj_name}」",
-                        suggestions=[f"先「创建项目 {proj_name}」"]))
-                    return
-                reply_card(mid, progress_card("正在识别内容", f"AI 解析中 → **{proj['name']}**", color="blue"))
-                try:
-                    extract_prompt = (
-                        "从以下内容中提取所有任务/议题/事项。内容可能是：\n"
-                        "- Markdown 表格\n- 纯文本列表\n- 会议纪要\n- 项目计划\n- 任意格式\n\n"
-                        "每条输出一行 JSON：\n"
-                        "{\"task\": \"任务描述\", \"source\": \"来源说明(如:会议纪要/表格导入/项目计划)\", "
-                        "\"assignee\": \"负责人或空\", \"status\": \"待开始/进行中/已完成\", "
-                        "\"priority\": \"P0/P1/P2或空\", \"due\": \"截止日期或空\", \"note\": \"备注或空\"}\n\n"
-                        "要求：\n"
-                        "- 尽量保留原始信息，不要丢失字段\n"
-                        "- 如果原文有表头，根据表头映射字段\n"
-                        "- 如果是自由文本，提取其中的任务/决议/待办\n"
-                        "- 只输出 JSON 行，不要其他文字。没有任务就输出 []\n\n"
-                        f"内容：\n{content[:4000]}"
-                    )
-                    raw = chat(extract_prompt)
-                    import json as _json
-                    items = []
-                    if raw and raw.strip().startswith("["):
-                        items = _json.loads(raw.strip())
-                    else:
-                        for line in (raw or "").strip().split("\n"):
-                            line = line.strip()
-                            if line.startswith("{"):
-                                try:
-                                    items.append(_json.loads(line))
-                                except _json.JSONDecodeError:
-                                    pass
-                    if not items:
-                        reply_card(mid, action_card(
-                            "📋 未识别到内容",
-                            "AI 没有从文本中提取到任务/事项。\n可以手动添加：\n"
-                            f"**{proj['name']} 加任务 xxx**",
-                            color="blue",
-                        ))
-                        return
-                    from memo.bitable_hub import add_task as _bt_add_task, get_hub_url
-                    success_count = 0
-                    for it in items:
-                        _ok, _ = _bt_add_task(
-                            project=proj["name"],
-                            task=it.get("task", ""),
-                            source=it.get("source", "导入"),
-                            assignee=it.get("assignee", ""),
-                            status=it.get("status", "待开始"),
-                            priority=it.get("priority", ""),
-                            due=it.get("due", ""),
-                            note=it.get("note", ""),
-                            team_code=_current_team_code,
-                        )
-                        if _ok:
-                            success_count += 1
-                    hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
-                    if success_count > 0:
-                        preview = items[:10]
-                        task_list = "\n".join(
-                            f"- {it.get('task', '')}"
-                            + (f"（{it.get('assignee', '')}）" if it.get("assignee") else "")
-                            for it in preview
-                        )
-                        if len(items) > 10:
-                            task_list += f"\n- …还有 {len(items) - 10} 条"
-                        reply_card(mid, action_card(
-                            f"✅ 已导入 {success_count} 条到 {proj['name']}",
-                            task_list
-                            + (f"\n\n[打开项目管理中心]({hub_url})" if hub_url else ""),
-                            color="green",
-                        ))
-                    else:
-                        _log("导入内容写入失败: 所有记录写入 Bitable 失败")
-                        reply_card(mid, error_card("写入失败", "操作失败，请稍后重试。"))
-                except Exception as e:
-                    _log(f"导入内容失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入内容失败", "操作失败，请稍后重试。"))
-                return
-
-            # ── 记账（含项目标签提示）──
-            if action == "add_expense":
-                desc = (params.get("description") or "").strip()
-                amt_str = (params.get("amount") or "").strip()
-                exp_type = (params.get("type") or "支出").strip()
-                proj_tag = (params.get("project") or "").strip()
-                cat = (params.get("category") or "其他").strip()
-                if not desc or not amt_str:
-                    reply_message(mid, "格式：记账 午餐 35\n或：支出 办公用品 200 #Q2营销")
-                    return
-                try:
-                    amt = float(amt_str)
-                except ValueError:
-                    reply_message(mid, f"金额「{amt_str}」不是数字，请重新输入。")
-                    return
-                if not proj_tag:
-                    tags = available_project_tags()
-                    if tags:
-                        tag_list = "　".join(f"`#{t}`" for t in tags[:8])
-                        _user_key = user_open_id or mid
-                        _set_pending(_user_key, "awaiting_expense_project",
-                                     description=desc, amount=amt, expense_type=exp_type,
-                                     category=cat)
-                        reply_card(mid, action_card(
-                            f"💰 {exp_type} ¥{amt:.0f} — {desc}",
-                            f"要归入哪个项目？\n{tag_list}\n\n"
-                            f"回复 **#项目名** 归入项目，或回复 **确认** 不归入项目直接记账。",
-                            color="blue",
-                        ))
-                        return
+            if _ps["type"] == "awaiting_expense_project":
+                _clear_pending(_user_key)
+                desc = _ps.get("description", "")
+                amt = _ps.get("amount", 0)
+                exp_type = _ps.get("expense_type", "支出")
+                cat = _ps.get("category", "其他")
+                proj_tag = ""
+                if t.lower() not in ("确认", "ok", "跳过", "不归入"):
+                    proj_tag = t.strip().lstrip("#")
                 record = add_expense(
                     amount=amt, description=desc, category=cat,
                     expense_type=exp_type, project=proj_tag,
@@ -1722,351 +785,1346 @@ def _handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 ))
                 return
 
-            # ── 批量记账（LLM 提取任意格式费用）──
-            if action == "import_expenses":
-                raw_content = (params.get("content") or text).strip()
-                proj_tag = (params.get("project") or "").strip()
-                if not raw_content or len(raw_content) < 5:
-                    reply_message(mid, "请发送费用数据（表格、列表或任意格式），我会自动识别。")
+        # ── 关键词快速匹配：备忘 ──
+        prefixes = (
+            "备忘 ", "备忘：", "备忘:", "记一下 ", "记一下：", "记一下:",
+            "别忘了 ", "别忘了：", "别忘了:", "任务 ", "任务：", "任务:",
+            "待办 ", "待办：", "待办:",
+        )
+        for prefix in prefixes:
+            if t.startswith(prefix):
+                raw_content = t[len(prefix):].strip()
+                if not raw_content:
+                    reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
                     return
-                reply_card(mid, progress_card("正在识别费用", "AI 解析中…", color="blue"))
-                try:
-                    extract_prompt = (
-                        "从以下文本中提取所有费用/支出/收入记录。\n"
-                        "每条输出一行 JSON：{\"date\": \"YYYY-MM-DD或空\", \"category\": \"类别\", "
-                        "\"description\": \"描述\", \"amount\": 数字, \"type\": \"支出或收入\"}\n"
-                        "类别从以下选择：人力、营销、设计、技术、办公、差旅、餐饮、其他\n"
-                        "金额必须是纯数字。如果原文没有日期就留空。\n"
-                        "只输出 JSON 行，不要其他文字。如果没有费用数据就输出 []\n\n"
-                        f"文本：\n{raw_content[:4000]}"
-                    )
-                    raw = chat(extract_prompt)
-                    import json as _json
-                    items = []
-                    if raw and raw.strip().startswith("["):
-                        items = _json.loads(raw.strip())
-                    else:
-                        for line in (raw or "").strip().split("\n"):
-                            line = line.strip()
-                            if line.startswith("{"):
-                                try:
-                                    items.append(_json.loads(line))
-                                except _json.JSONDecodeError:
-                                    pass
-                    if not items:
-                        reply_card(mid, action_card(
-                            "💰 未识别到费用",
-                            "AI 没有从内容中提取到费用记录。\n"
-                            "请确认内容包含金额信息，或尝试：**记账 描述 金额**",
-                            color="blue",
-                        ))
-                        return
-                    records = []
-                    for it in items:
-                        try:
-                            amt = float(it.get("amount", 0))
-                        except (ValueError, TypeError):
-                            continue
-                        if amt <= 0:
-                            continue
-                        r = add_expense(
-                            amount=amt,
-                            description=it.get("description", ""),
-                            category=it.get("category", "其他"),
-                            project=proj_tag or "",
-                            date=it.get("date", ""),
-                            expense_type=it.get("type", "支出"),
-                            user_open_id=user_open_id or "",
-                            team_code=_current_team_code,
-                        )
-                        records.append(r)
-                    if not records:
-                        reply_message(mid, "提取到的记录金额均无效，请检查数据。")
-                        return
-                    total = sum(r["amount"] for r in records)
-                    detail_lines = []
-                    for r in records[:15]:
-                        tag = f" #{r['project']}" if r.get("project") else ""
-                        detail_lines.append(f"- {r['type']} ¥{r['amount']:,.0f} {r['description']}{tag}")
-                    if len(records) > 15:
-                        detail_lines.append(f"- …还有 {len(records) - 15} 条")
+                items = _split_multi_memos(raw_content)
+                if len(items) > 1:
+                    saved = []
+                    has_claude = False
+                    for item in items:
+                        c, cat, th, asn = _parse_memo_with_thread(item)
+                        if c:
+                            new_id = store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th, assignee=asn)
+                            _auto_append_board(th, c, assignee=asn, memo_id=new_id)
+                            tag = f" #{th}" if th else ""
+                            claude_tag = " 🤖" if asn == "claude" else ""
+                            saved.append(f"- {c[:60]}{tag}{claude_tag}")
+                            if asn == "claude":
+                                has_claude = True
+                    if saved:
+                        title = f"📝 已记下 {len(saved)} 条备忘"
+                        hints = ["发「线程」查看工作线程", "发「备忘列表」查看全部"]
+                        if has_claude:
+                            hints.insert(0, "🤖 标记的任务将由 Claude 处理")
+                        reply_card(mid, action_card(title, "\n".join(saved), hints=hints, color="green"))
+                        _log(f"备忘(多条拆分): {len(saved)} 条")
+                    return
+                content, category, thread, assignee = _parse_memo_with_thread(raw_content)
+                if not content:
+                    reply_message(mid, "请说一下要记的内容，例如：任务 写周报")
+                    return
+                new_id = store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread, assignee=assignee)
+                _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
+                tag_hint = ""
+                if thread:
+                    tag_hint = f" #{thread}"
+                elif category:
+                    tag_hint = f"（{MEMO_CATEGORY_DISPLAY.get(category, category)}）"
+                if assignee == "claude":
                     reply_card(mid, action_card(
-                        f"✅ 已导入 {len(records)} 笔，共 ¥{total:,.2f}",
-                        "\n".join(detail_lines),
-                        hints=["「本月花费」查看月度汇总", "「预算概览 项目名」查预算"],
+                        f"🤖 已记下，将由 Claude 处理{tag_hint}",
+                        f"**{content[:100]}**",
+                        hints=["Claude 会自动拾取并执行此任务", "完成后会推送结果到飞书"],
+                        color="purple",
+                    ))
+                else:
+                    reply_card(mid, action_card(
+                        f"📝 已记下备忘{tag_hint}",
+                        f"**{content[:100]}**",
+                        hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
                         color="green",
                     ))
-                except Exception as e:
-                    _log(f"批量记账失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("导入费用失败", "操作失败，请稍后重试。"))
+                _log(f"备忘(关键词): 已写入 thread={thread} assignee={assignee}")
                 return
 
-            # ── 月度花费 ──
-            if action == "month_expenses":
-                month = (params.get("month") or "").strip()
+        if t.lower().startswith("todo ") or t.lower().startswith("todo:"):
+            raw_content = t[5:].lstrip(" :").strip()
+            if raw_content:
+                content, category, thread, assignee = _parse_memo_with_thread(raw_content)
+                new_id = store_add_memo(content, user_open_id=user_open_id, category=category, thread=thread, assignee=assignee)
+                _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
+                tag_hint = f" #{thread}" if thread else ""
+                reply_card(mid, action_card(
+                    f"📝 已记下备忘{tag_hint}",
+                    f"**{content[:100]}**",
+                    hints=["发「线程」查看工作线程", "发「备忘列表」查看全部"],
+                    color="green",
+                ))
+                _log(f"todo(关键词): 已写入 thread={thread}")
+                return
+
+        if t in ("备忘", "记一下", "别忘了", "任务", "待办"):
+            reply_message(mid, "请说「备忘 具体内容」或「任务 具体内容」～")
+            return
+
+        # ── 完成备忘 ──
+        _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        def _cn2int(s: str) -> Optional[int]:
+            s = s.strip()
+            if s.isdigit():
+                return int(s)
+            if s in _CN_NUM:
+                return _CN_NUM[s]
+            if s.startswith("十") and len(s) == 2 and s[1] in _CN_NUM:
+                return 10 + _CN_NUM[s[1]]
+            return None
+
+        _done_prefix = r"(完成|done|搞定|✅|做完了|标记完成|已完成|办好了|弄好了)"
+
+        # 批量完成：「完成 1、2、3」「完成 1,2,3,4,5」「完成 1 2 3」（允许末尾逗号）
+        m_done_batch = re.match(
+            rf"^{_done_prefix}\s*((?:\d+[\s,，、]*)+)\s*$", t, re.IGNORECASE
+        )
+        if m_done_batch and len(re.findall(r"\d+", m_done_batch.group(2))) >= 2:
+            raw_nums = m_done_batch.group(2)
+            indices = sorted(set(int(x) for x in re.findall(r"\d+", raw_nums)), reverse=True)
+            results = []
+            for idx in indices:
+                ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                results.append(msg_text)
+            results.reverse()
+            reply_message(mid, "\n".join(results))
+            return
+
+        m_done = re.match(
+            rf"^{_done_prefix}\s*第?\s*(\d+)\s*条?\s*$", t, re.IGNORECASE
+        )
+        if m_done:
+            idx = int(m_done.group(2))
+            ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+            reply_message(mid, msg_text)
+            return
+
+        m_done_cn = re.match(
+            rf"^{_done_prefix}\s*第?\s*([一二三四五六七八九十]+)\s*条?\s*$", t, re.IGNORECASE
+        )
+        if m_done_cn:
+            idx = _cn2int(m_done_cn.group(2))
+            if idx:
+                ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+
+        m_done_rev = re.match(
+            r"^第\s*(\d+|[一二三四五六七八九十]+)\s*条?\s*(完成|搞定|做完了|办好了|弄好了)\s*$", t
+        )
+        if m_done_rev:
+            idx = _cn2int(m_done_rev.group(1))
+            if idx:
+                ok, msg_text = store_complete_by_index(idx, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+
+        m_done_kw = re.match(
+            rf"^{_done_prefix}\s*[：:]?\s*(.+)$", t, re.IGNORECASE
+        )
+        if m_done_kw:
+            keyword = m_done_kw.group(2).strip()
+            if not keyword.isdigit() and keyword not in _CN_NUM:
+                ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+
+        # ── 清除/删除备忘 ──
+        _del_idx = None
+        m_clear = re.match(
+            r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*第?\s*(\d+)\s*条?\s*$", t
+        )
+        if m_clear:
+            _del_idx = m_clear.group(2)
+        if not _del_idx:
+            m_clear2 = re.match(
+                r"^(清除备忘|删除备忘|删掉|删除|移除|去掉)\s*[：:]\s*(\d+)\s*$", t
+            )
+            if m_clear2:
+                _del_idx = m_clear2.group(2)
+        if not _del_idx:
+            m_clear3 = re.match(r"^第\s*(\d+)\s*条?\s*(删掉|删除|移除|去掉)\s*$", t)
+            if m_clear3:
+                _del_idx = m_clear3.group(1)
+        if _del_idx:
+            try:
+                idx = int(_del_idx)
+                ok, msg_text = store_delete_memo_by_index(idx, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+            except ValueError:
+                pass
+
+        m_clear_kw = re.match(
+            r"^(清除备忘|删除备忘|删掉备忘|删掉|删除|移除|去掉)\s*[：:]?\s*(.+)$", t
+        )
+        if m_clear_kw:
+            keyword = m_clear_kw.group(2).strip()
+            if not keyword.isdigit():
+                ok, msg_text = store_delete_memo_by_content(keyword, user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+
+        # ── 设置分类 ──
+        m_set_cat = (
+            re.match(r"^(?:把)?第\s*(\d+)\s*条\s*(?:标成|设为|标为)\s*(日常|灵感|要事)\s*$", t)
+            or re.match(r"^(日常|灵感|要事)\s*[：:]\s*第\s*(\d+)\s*条\s*$", t)
+        )
+        if m_set_cat:
+            if m_set_cat.lastindex == 2 and m_set_cat.group(1).isdigit():
+                idx, cat = int(m_set_cat.group(1)), m_set_cat.group(2)
+            else:
+                cat, idx = m_set_cat.group(1), int(m_set_cat.group(2))
+            ok, msg_text = store_set_memo_category_by_index(idx, cat, user_open_id=user_open_id)
+            reply_message(mid, msg_text)
+            return
+
+        # ── 意图解析 ──
+        _log("解析意图...")
+        intent = parse_intent(text)
+        action = intent.get("action", "chat")
+        params = intent.get("params") or {}
+        reply = intent.get("reply") or ""
+        _log(f"意图: action={action}")
+
+        # ── 加日历 ──
+        if action == "add_calendar" and user_open_id:
+            title = params.get("title") or "日程"
+            start_time = params.get("start_time") or ""
+            end_time = params.get("end_time") or ""
+            if not start_time or not end_time:
+                reply_message(mid, "加日历需要明确开始和结束时间，请再说清楚一点～")
+                return
+            cal_token_create = get_user_access_token("calendar_create")
+            cal_id = (os.environ.get("FEISHU_CALENDAR_ID") or "").strip()
+            if not cal_id:
+                cal_token_get = get_user_access_token("calendar_get")
+                cal_id = get_primary_calendar_id(user_open_id, user_access_token=cal_token_get)
+            if not cal_id:
+                reply_message(mid, "无法获取你的日历，请配置 FEISHU_TOKEN_CALENDAR_GET 后重试。")
+                return
+            ok, msg_text = create_calendar_event(
+                cal_id, title, start_time, end_time,
+                params.get("description") or "",
+                user_access_token=cal_token_create,
+            )
+            if not ok and ("access_role" in msg_text.lower() or "no calendar" in msg_text.lower()) and not cal_token_create:
+                msg_text = "往你的个人日历里加日程需要「用户身份」授权。请在 .env 中配置 FEISHU_TOKEN_CALENDAR_CREATE 后再试。"
+            reply_message(mid, msg_text)
+            return
+
+        # ── 备忘相关 ──
+        if action in ("add_todo", "add_task"):
+            content = (params.get("title") or params.get("summary") or params.get("content") or text).strip()
+            for prefix in ("待办 ", "待办：", "待办:", "任务 ", "任务：", "任务:", "todo "):
+                if content.lower().startswith(prefix) or content.startswith(prefix):
+                    content = content[len(prefix):].strip()
+                    break
+            store_add_memo(content or "未命名", user_open_id=user_open_id)
+            reply_message(mid, "已记下备忘～")
+            return
+
+        if action in ("add_memo", "add_memos"):
+            raw = params.get("content") or text.strip()
+            items_from_llm = params.get("items")
+            if isinstance(items_from_llm, list) and len(items_from_llm) > 1:
+                memo_items = items_from_llm
+            else:
+                memo_items = _split_multi_memos(raw)
+
+            if len(memo_items) > 1:
+                saved = []
+                has_claude = False
+                for item in memo_items:
+                    c, cat, th, asn = _parse_memo_with_thread(item.strip() if isinstance(item, str) else str(item))
+                    if c:
+                        new_id = store_add_memo(c, user_open_id=user_open_id, category=cat, thread=th, assignee=asn)
+                        _auto_append_board(th, c, assignee=asn, memo_id=new_id)
+                        tag = f" #{th}" if th else ""
+                        claude_tag = " 🤖" if asn == "claude" else ""
+                        saved.append(f"- {c[:60]}{tag}{claude_tag}")
+                        if asn == "claude":
+                            has_claude = True
+                if saved:
+                    hints = ["发「线程」查看工作线程", "发「备忘列表」查看全部"]
+                    if has_claude:
+                        hints.insert(0, "🤖 标记的任务将由 Claude 处理")
+                    reply_card(mid, action_card(
+                        f"📝 已记下 {len(saved)} 条备忘",
+                        "\n".join(saved),
+                        hints=hints, color="green",
+                    ))
+                else:
+                    reply_message(mid, "请说一下要记的备忘内容～")
+                return
+
+            content, category, thread, assignee = _parse_memo_with_thread(raw)
+            if not content:
+                reply_message(mid, "请说一下要记的备忘内容～")
+                return
+            if not thread:
+                thread = (params.get("thread") or "").strip()
+            reminder = (params.get("reminder_date") or "").strip() or None
+            new_id = store_add_memo(content, user_open_id=user_open_id, reminder_date=reminder, category=category, thread=thread, assignee=assignee)
+            _auto_append_board(thread, content, assignee=assignee, memo_id=new_id)
+            tag_hint = f" #{thread}" if thread else ""
+            date_hint = f"（提醒：{reminder}）" if reminder else ""
+            if assignee == "claude":
+                reply_card(mid, action_card(
+                    f"🤖 已记下，将由 Claude 处理{tag_hint}",
+                    f"**{content[:100]}**{date_hint}",
+                    hints=["Claude 会自动拾取并执行此任务", "完成后会推送结果到飞书"],
+                    color="purple",
+                ))
+            else:
+                reply_message(mid, f"已记下备忘～{tag_hint}{date_hint}")
+            return
+
+        if action == "list_memos":
+            thread_filter = params.get("thread", "")
+            memos = store_list_memos(
+                limit=50, user_open_id=user_open_id,
+                thread=thread_filter or None, include_done=False,
+            )
+            if not memos:
+                reply_card(mid, action_card("📋 暂无未完成的备忘", hints=["发「备忘 内容」开始记"], color="blue"))
+                return
+            lines = []
+            for i, m in enumerate(memos, 1):
+                thread = m.get("thread") or ""
+                tag = f"[#{thread}] " if thread else ""
+                lines.append(f"{i}. {tag}{m.get('content', '')}")
+            reply_card(mid, action_card(
+                f"📋 待办列表（{len(memos)} 条未完成）",
+                "\n".join(lines)[:2000],
+                hints=["「完成 3」或「完成 1,2,3」批量完成", "「删除 3」删除", "「线程」看工作线"],
+                color="blue",
+            ))
+            return
+
+        if action == "list_tasks":
+            memos = store_list_memos(limit=10, user_open_id=user_open_id)
+            if not memos:
+                reply_message(mid, "暂无未完成的备忘。")
+                return
+            lines = ["未完成备忘（「完成 序号」标记完成）："]
+            for i, m in enumerate(memos, 1):
+                thread = m.get("thread") or ""
+                tag = f"[#{thread}] " if thread else ""
+                lines.append(f"{i}. {tag}{m.get('content', '')}")
+            reply_message(mid, "\n".join(lines)[:2000])
+            return
+
+        if action == "list_all_memos":
+            memos = store_list_memos(limit=200, user_open_id=user_open_id, include_done=True)
+            if not memos:
+                reply_message(mid, "暂无备忘。")
+                return
+            lines = [f"所有备忘（共 {len(memos)} 条，含已完成）："]
+            for i, m in enumerate(memos, 1):
+                thread = m.get("thread") or ""
+                tag = f"[#{thread}] " if thread else ""
+                done = "✅ " if m.get("done") else ""
+                lines.append(f"{i}. {done}{tag}{m.get('content', '')}")
+            reply_message(mid, "\n".join(lines)[:4000])
+            return
+
+        if action == "list_memos_by_category":
+            cat = (params.get("category") or "").strip()
+            memos = store_list_memos(limit=200, user_open_id=user_open_id, category=cat)
+            if not memos:
+                reply_message(mid, f"暂无「{cat}」类备忘。")
+                return
+            lines = [f"「{cat}」类备忘（共 {len(memos)} 条）："]
+            for i, m in enumerate(memos, 1):
+                lines.append(f"{i}. {m.get('content', '')}")
+            reply_message(mid, "\n".join(lines)[:4000])
+            return
+
+        if action == "set_memo_category":
+            idx = params.get("index") or params.get("序号")
+            cat = (params.get("category") or params.get("分类") or "").strip()
+            if not idx or not cat:
+                reply_message(mid, "请说「第3条标成灵感」或「把第2条设为要事」。")
+                return
+            try:
+                num = int(idx)
+            except (TypeError, ValueError):
+                reply_message(mid, "序号需为数字。")
+                return
+            ok, msg_text = store_set_memo_category_by_index(num, cat, user_open_id=user_open_id)
+            reply_message(mid, msg_text)
+            return
+
+        if action == "delete_memo":
+            idx = params.get("index") or params.get("序号")
+            keyword = params.get("keyword", "")
+            if idx is not None:
                 try:
-                    summary = month_summary(month)
-                    if summary["count"] == 0:
-                        reply_card(mid, action_card(
-                            f"💰 {summary['month']} 暂无记录",
-                            "还没有记账数据。\n说 **记账 描述 金额** 开始记账。",
-                            color="blue",
-                        ))
-                        return
-                    lines = [f"**{summary['month']}** 共 {summary['count']} 笔\n"]
-                    lines.append(f"支出：**¥{summary['total_expense']:,.2f}**")
-                    if summary["total_income"] > 0:
-                        lines.append(f"收入：¥{summary['total_income']:,.2f}")
-                    if summary["by_category"]:
-                        lines.append("\n**按类别：**")
-                        for cat, val in summary["by_category"].items():
-                            lines.append(f"- {cat}　¥{val:,.0f}")
-                    if summary["by_project"]:
-                        lines.append("\n**按项目：**")
-                        for proj, val in summary["by_project"].items():
-                            lines.append(f"- {proj}　¥{val:,.0f}")
-                    from memo.bitable_hub import get_hub_url as _get_hub_url
-                    _hub = _get_hub_url(team_code=_current_team_code)
-                    if _hub:
-                        lines.append(f"\n[打开项目管理中心]({_hub})")
-                    reply_card(mid, action_card(
-                        f"💰 {summary['month']} 月度花费",
-                        "\n".join(lines),
-                        hints=["「预算概览 项目名」看预算执行", "「项目名 总览」看全维度"],
-                        color="blue",
+                    num = int(idx)
+                    ok, msg_text = store_delete_memo_by_index(num, user_open_id=user_open_id)
+                    reply_message(mid, msg_text)
+                    return
+                except (TypeError, ValueError):
+                    pass
+            if keyword:
+                ok, msg_text = store_delete_memo_by_content(str(keyword), user_open_id=user_open_id)
+                reply_message(mid, msg_text)
+                return
+            reply_message(mid, "请说「删除 序号」或「删除 关键词」，例如：删除 3 / 删掉 买牛奶")
+            return
+
+        if action == "complete_memo":
+            idx = params.get("index")
+            keyword = params.get("keyword", "")
+            if idx is not None:
+                try:
+                    ok, msg_text = store_complete_by_index(int(idx), user_open_id=user_open_id)
+                except (ValueError, TypeError):
+                    ok, msg_text = False, "序号需为数字，例如：完成 3"
+            elif keyword:
+                ok, msg_text = store_complete_by_content(keyword, user_open_id=user_open_id)
+            else:
+                ok, msg_text = False, "请说「完成 3」（按序号）或「完成 买牛奶」（按内容）"
+            reply_message(mid, msg_text)
+            return
+
+        if action == "complete_task":
+            reply_message(mid, "请用「完成 序号」或「完成 关键词」来标记备忘完成～")
+            return
+
+        # ── 线程相关 ──
+        if action == "list_threads":
+            threads = store_list_threads(user_open_id=user_open_id)
+            if not threads:
+                reply_card(mid, action_card("📂 暂无工作线程", "发备忘时加 #标签 即可创建线程\n例如：备忘 完成 deck #creator", color="blue"))
+                return
+            total_pending = sum(info.get("pending", 0) for info in threads)
+            lines = []
+            for info in threads:
+                t = info["thread"]
+                latest = info.get("latest_content", "")[:30]
+                pending = info.get("pending", 0)
+                done = info.get("done", 0)
+                suffix = f"{'…' if len(info.get('latest_content', '')) > 30 else ''}"
+                if done > 0:
+                    lines.append(f"**#{t}** ({pending}条待办 / {done}条已完成) — {latest}{suffix}")
+                else:
+                    lines.append(f"**#{t}** ({pending}条待办) — {latest}{suffix}")
+            reply_card(mid, action_card(
+                f"📂 工作线程（{len(threads)} 个 · {total_pending} 条待办）",
+                "\n".join(lines)[:2000],
+                hints=["「#creator进展」查某条线", "「哪条线最久没动」查沉寂"],
+                color="blue",
+            ))
+            return
+
+        if action == "thread_progress":
+            thread_name = (params.get("thread") or "").strip()
+            if not thread_name:
+                reply_message(mid, "请说线程名，例如「#creator进展」。")
+                return
+            memos = store_list_memos(thread=thread_name, user_open_id=user_open_id, limit=10)
+            if not memos:
+                reply_message(mid, f"#{thread_name} 暂无备忘。")
+                return
+            lines = [f"**#{thread_name}** 最近动态（{len(memos)} 条）：\n"]
+            for i, m in enumerate(memos, 1):
+                date = (m.get("created_at") or "")[:10]
+                lines.append(f"{i}. [{date}] {m.get('content', '')}")
+            reply_card(mid, action_card(
+                f"📌 #{thread_name} 进展",
+                "\n".join(lines)[:2000],
+                hints=["「线程」看所有线程", f"「备忘 xxx #{thread_name}」继续记"],
+                color="indigo",
+            ))
+            return
+
+        if action == "stale_threads":
+            summary = store_thread_summary(user_open_id=user_open_id, days=7)
+            stale = summary.get("stale", [])
+            if not stale:
+                reply_message(mid, "所有线程本周都有动态，没有沉寂的 👍")
+                return
+            lines = ["本周没有新备忘的线程：\n"]
+            for s in stale[:8]:
+                lines.append(f"💤 **#{s['thread']}** — {s['days_silent']}天没动了（共{s['total']}条备忘）")
+            reply_card(mid, action_card(
+                "💤 沉寂线程",
+                "\n".join(lines)[:2000],
+                hints=["发「#xxx进展」查某条线详情"],
+                color="yellow",
+            ))
+            return
+
+        if action == "weekly_report":
+            summary = store_thread_summary(user_open_id=user_open_id, days=7)
+            active = summary.get("active", {})
+            stale = summary.get("stale", [])
+            lines = ["📊 **本周工作线程概览**\n"]
+            if active:
+                lines.append("🔥 **活跃**")
+                for t, info in sorted(active.items(), key=lambda x: x[1]["count"], reverse=True):
+                    if t == "(未分类)":
+                        continue
+                    preview = "、".join(info["items"][:2])
+                    lines.append(f"  **#{t}** ({info['count']}条) — {preview}")
+                uncat = active.get("(未分类)")
+                if uncat:
+                    lines.append(f"  _(未分类 {uncat['count']}条)_")
+            if stale:
+                lines.append("\n💤 **沉寂**")
+                for s in stale[:5]:
+                    lines.append(f"  **#{s['thread']}** — {s['days_silent']}天没动")
+            if not active and not stale:
+                lines.append("本周暂无备忘记录。")
+            reply_card(mid, action_card(
+                "📊 周报",
+                "\n".join(lines)[:2000],
+                hints=["「#xxx进展」查某条线", "「线程」查所有"],
+                color="indigo",
+            ))
+            return
+
+        # ── 月报 ──
+        if action == "monthly_report":
+            month = (params.get("month") or "").strip()
+            reply_card(mid, progress_card("正在生成月报", f"AI 汇总线程+项目+财务…", color="indigo"))
+            try:
+                from cal.daily_brief import generate_monthly_report
+                report = generate_monthly_report(month=month, user_open_id=user_open_id)
+                if not report:
+                    report = "暂无足够数据生成月报。"
+                if len(report) > 3500:
+                    parts = [report[i:i+3500] for i in range(0, len(report), 3500)]
+                    for i, part in enumerate(parts):
+                        title = "📊 月度报告" if i == 0 else f"📊 月度报告（续 {i+1}）"
+                        reply_card(mid, action_card(title, part, color="indigo"))
+                else:
+                    reply_card(mid, action_card("📊 月度报告", report, color="indigo"))
+            except Exception as e:
+                _log(f"月报生成失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("月报生成失败", "生成失败，请稍后重试。"))
+            return
+
+        # ── 翻译 & 英文写作 ──
+        if action == "translate":
+            content = (params.get("content") or text).strip()
+            if not content:
+                reply_message(mid, "请说要翻译的内容，例如：翻译 我们希望在Q2完成优化")
+                return
+            target_lang = (params.get("target_lang") or "").strip()
+            scene = (params.get("scene") or "").strip()
+            mode = (params.get("mode") or "translate").strip()
+            _log(f"翻译请求: mode={mode} target_lang={target_lang} scene={scene} content_len={len(content)}")
+            try:
+                if mode == "compose":
+                    from skills.translation import COMPOSE_SYSTEM_PROMPT
+                    system = COMPOSE_SYSTEM_PROMPT
+                else:
+                    from skills.translation import TRANSLATE_SYSTEM_PROMPT
+                    system = TRANSLATE_SYSTEM_PROMPT
+
+                user_parts = []
+                if target_lang:
+                    lang_label = "英文" if target_lang == "en" else "中文"
+                    user_parts.append(f"目标语言：{lang_label}")
+                if scene:
+                    user_parts.append(f"使用场景：{scene}")
+                user_parts.append(f"\n{content}")
+                user_prompt = "\n".join(user_parts)
+
+                provider = (os.environ.get("TRANSLATE_PROVIDER") or "deepseek").strip().lower()
+                _log(f"翻译 provider={provider}")
+                result = chat_completion(
+                    provider=provider,
+                    system=system,
+                    user=user_prompt,
+                    temperature=0.4,
+                )
+                if not result:
+                    _log("翻译返回空结果")
+                    reply_card(mid, error_card("翻译失败", "模型返回了空结果，请稍后重试。"))
+                    return
+
+                card_title = "✍️ 英文写作" if mode == "compose" else "🌐 翻译结果"
+                if len(result) > 3500:
+                    parts = [result[i:i+3500] for i in range(0, len(result), 3500)]
+                    for i, part in enumerate(parts):
+                        title = card_title if i == 0 else f"{card_title}（续 {i+1}）"
+                        reply_card(mid, action_card(title, part, color="blue"))
+                else:
+                    reply_card(mid, action_card(card_title, result, color="blue"))
+                _log(f"翻译完成: mode={mode} result_len={len(result)}")
+            except Exception as e:
+                _log(f"翻译失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card(
+                    "翻译失败",
+                    f"请稍后重试。\n\n_(debug: {type(e).__name__}: {str(e)[:100]})_",
+                ))
+            return
+
+        # ── 联网研究 ──
+        if action == "research":
+            topic = (params.get("topic") or text).strip()
+            if not topic:
+                reply_message(mid, "请说要研究什么，例如：研究 Character.ai 增长机制")
+                return
+            reply_card(mid, progress_card(
+                "正在研究",
+                f"**课题：**{topic[:100]}\n\n"
+                "正在多来源搜索、交叉验证、分析机制……\n"
+                "预计 1–3 分钟，完成后发送完整报告。",
+                color="indigo",
+            ))
+            try:
+                from research.researcher import Researcher
+                researcher = Researcher()
+                report = researcher.research(topic, verbose=False)
+            except Exception as e:
+                _log(f"研究失败: {e}\n{traceback.format_exc()}")
+                if user_open_id:
+                    send_card_to_user(user_open_id, error_card(
+                        "研究失败", "生成失败，请稍后重试。",
+                        suggestions=["换个说法重试", "发「帮助」查看指令"],
                     ))
-                except Exception as e:
-                    _log(f"月度花费失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
                 return
 
-            # ── 创建预算 ──
-            if action == "create_budget":
-                proj_name = (params.get("project") or "").strip()
-                if not proj_name:
-                    reply_message(mid, "请说项目名称，例如：创建预算 Q2营销")
+            _send_research_report(mid, user_open_id, topic, report)
+            return
+
+        # ── 导出线程看板 ──
+        if action == "export_board":
+            thread_filter = (params.get("thread") or "").strip()
+            title = f"📋 线程看板 — #{thread_filter}" if thread_filter else "📋 线程看板"
+            reply_card(mid, progress_card("正在生成看板", title, color="blue"))
+            try:
+                ok_b, url_or_err, board_stats = bitable_refresh_board(
+                    user_open_id=user_open_id,
+                    thread=thread_filter or None,
+                )
+                if not ok_b:
+                    _log(f"看板刷新失败: {url_or_err}")
+                    reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
                     return
-                existing = find_budget(proj_name)
-                if existing:
-                    reply_card(mid, action_card(
-                        "💰 预算已存在",
-                        f"**{existing['project']}** 总预算 ¥{existing['total_budget']:,.0f}",
-                        hints=[f"「{proj_name} 预算」查看详情", f"「{proj_name} 总览」看全维度"],
-                        color="blue",
-                    ))
+
+                if not board_stats or sum(board_stats.values()) == 0:
+                    hint = f"线程 #{thread_filter} 下没有备忘" if thread_filter else "还没有备忘数据"
+                    reply_card(mid, action_card("📋 看板为空", hint,
+                        hints=["发「备忘 xxx #线程」添加内容", "发「线程」查看现有线程"],
+                        color="blue"))
                     return
+
+                board_url = url_or_err or get_bitable_board_url()
+                _stats_line = (
+                    f"今日新增 {board_stats.get('today', 0)} 条 | "
+                    f"本周进行中 {board_stats.get('week', 0)} 条 | "
+                    f"等待跟进 {board_stats.get('stale', 0)} 条 | "
+                    f"已完成 {board_stats.get('done', 0)} 条"
+                )
+
+                reply_card(mid, action_card(
+                    "📋 线程看板已刷新",
+                    f"**{title}**\n\n"
+                    f"[点击打开看板]({board_url})\n\n"
+                    f"{_stats_line}"
+                    + ("\n\n新增备忘会自动追加到此看板" if thread_filter else ""),
+                    hints=["数据来自你的备忘，可在飞书中编辑", "再发「看板」可刷新"],
+                    color="green",
+                ))
+            except Exception as e:
+                _log(f"生成线程看板失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("生成看板失败", "操作失败，请稍后重试。"))
+            return
+
+        # ── 创建项目 ──
+        if action == "create_project":
+            proj_name = (params.get("name") or "").strip()
+            if not proj_name:
+                reply_message(mid, "请说项目名称，例如：创建项目 Q2营销")
+                return
+            existing = find_project(proj_name)
+            if existing:
+                _url = existing.get("bitable_url") or existing.get("url", "")
+                reply_card(mid, action_card(
+                    "📋 项目已存在",
+                    f"**{existing['name']}**\n[打开项目管理中心]({_url})",
+                    hints=[f"直接说「{existing['name']} 加任务 xxx」添加内容"],
+                    color="blue",
+                ))
+                return
+            reply_card(mid, progress_card("正在创建项目", f"**{proj_name}**", color="blue"))
+            try:
+                from memo.bitable_hub import ensure_hub
+                ensure_hub(team_code=_current_team_code)
+                register_project(
+                    name=proj_name,
+                    spreadsheet_token="",
+                    sheet_id="",
+                    url="",
+                    created_by=user_open_id or "",
+                    team_code=_current_team_code,
+                )
+                proj = find_project(proj_name)
+                hub_url = (proj or {}).get("bitable_url", "")
                 _user_key = user_open_id or mid
                 _set_pending(_user_key, "awaiting_budget_items", project=proj_name)
                 reply_card(mid, action_card(
-                    f"💰 创建预算 — {proj_name}",
-                    "请发送预算项（每行一项），格式：\n"
-                    "> 类别 金额\n\n"
-                    "例如：\n"
+                    "📋 项目已创建",
+                    f"**{proj_name}**\n\n"
+                    + (f"[打开项目管理中心]({hub_url})\n\n" if hub_url else "")
+                    + "**接下来设置预算**（每行：类别 金额）：\n"
                     "> 营销 50000\n"
                     "> 设计 10000\n"
                     "> 差旅 5000\n\n"
-                    "发「取消」跳过。",
+                    "直接发送预算项，或发「取消」跳过。",
+                    hints=[
+                        f"「{proj_name} 加任务 xxx」添加任务",
+                        "发飞书妙记链接可直接归档到资料库",
+                    ],
+                    color="green",
+                ))
+            except Exception as e:
+                _log(f"创建项目失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("创建项目失败", "操作失败，请稍后重试。"))
+            return
+
+        # ── 项目列表 ──
+        if action == "list_projects":
+            projects = store_list_projects()
+            if not projects:
+                reply_card(mid, action_card(
+                    "📋 暂无项目",
+                    "还没有创建过项目表。",
+                    hints=["说「创建项目 xxx」开始"],
                     color="blue",
                 ))
                 return
+            lines = []
+            from memo.bitable_hub import get_hub_url as _get_hub_url
+            _hub = _get_hub_url(team_code=_current_team_code)
+            for i, p in enumerate(projects, 1):
+                _purl = p.get("bitable_url") or p.get("url", "")
+                lines.append(f"{i}. **{p['name']}**　_{p['created_at'][:10]}_")
+            if _hub:
+                lines.append(f"\n[打开项目管理中心]({_hub})")
+            reply_card(mid, action_card(
+                f"📋 项目列表（{len(projects)} 个）",
+                "\n".join(lines),
+                hints=["「项目名 加任务 xxx」添加内容", "发妙记链接可归档到资料库"],
+                color="blue",
+            ))
+            return
 
-            # ── 预算概览 ──
-            if action == "budget_overview":
-                proj_name = (params.get("project") or "").strip()
-                if not proj_name:
-                    reply_message(mid, "请说项目名称，例如：预算概览 Q2营销")
-                    return
-                try:
-                    headers, rows, summary = budget_vs_actual(proj_name)
-                    if "error" in summary:
-                        reply_card(mid, error_card("预算概览", summary["error"],
-                            suggestions=[f"先「创建预算 {proj_name}」"]))
-                        return
-                    lines = [
-                        f"总预算：**¥{summary['total_budget']:,.0f}**\n"
-                        f"已花费：**¥{summary['total_actual']:,.0f}**\n"
-                        f"剩余：¥{summary['total_remaining']:,.0f}　使用率 {summary['usage_pct']}\n"
-                    ]
-                    lines.append("| 预算项 | 预算 | 实际 | 剩余 | 使用率 |")
-                    lines.append("|--------|------|------|------|--------|")
-                    for r in rows:
-                        lines.append(f"| {r[0]} | ¥{r[2]} | ¥{r[3]} | ¥{r[4]} | {r[5]} |")
-                    reply_card(mid, action_card(
-                        f"💰 {proj_name} 预算概览",
-                        "\n".join(lines),
-                        hints=[f"「{proj_name} 总览」看全维度", "「本月花费」看月度汇总"],
-                        color="blue",
-                    ))
-                except Exception as e:
-                    _log(f"预算概览失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
+        # ── 加任务到项目 ──
+        if action == "add_project_task":
+            proj_name = (params.get("project") or "").strip()
+            task_text = (params.get("task") or "").strip()
+            if not proj_name or not task_text:
+                reply_message(mid, "格式：Q2营销 加任务 写推广方案\n或：加任务 写推广方案 到 Q2营销")
                 return
-
-            # ── 设目标 ──
-            if action == "add_goal":
-                proj_name = (params.get("project") or "").strip()
-                goal_name = (params.get("name") or "").strip()
-                target = (params.get("target") or "").strip()
-                unit = (params.get("unit") or "").strip()
-                if not proj_name or not goal_name or not target:
-                    reply_message(mid, "格式：Q2营销 设目标 新增用户 10000 人")
-                    return
-                goal = add_goal(proj_name, goal_name, target, unit, team_code=_current_team_code)
-                reply_card(mid, action_card(
-                    "🎯 目标已设定",
-                    f"**{proj_name}**\n{goal_name}：{target}{unit}\n\n"
-                    f"说 **更新目标 {goal_name} 当前值** 更新进度",
-                    hints=[f"「{proj_name} 总览」看全维度仪表盘"],
-                    color="green",
+            proj = find_project(proj_name)
+            if not proj:
+                reply_card(mid, error_card(
+                    "未找到项目",
+                    f"没有名为「{proj_name}」的项目",
+                    suggestions=[f"先「创建项目 {proj_name}」", "「项目列表」查看已有项目"],
                 ))
                 return
-
-            # ── 更新目标 ──
-            if action == "update_goal":
-                kw = (params.get("keyword") or "").strip()
-                current = (params.get("current") or "").strip()
-                if not kw or not current:
-                    reply_message(mid, "格式：更新目标 新增用户 7500")
-                    return
-                goal = find_goal_by_keyword(kw)
-                if not goal:
-                    reply_message(mid, f"没找到包含「{kw}」的目标。")
-                    return
-                ok, msg = update_goal(goal["id"], current=current)
+            try:
+                from memo.bitable_hub import add_task as _bt_add_task, get_hub_url
+                assignee = ""
+                import re as _re
+                m_at = _re.search(r"[@＠]([\w\u4e00-\u9fff]+)", task_text)
+                if m_at:
+                    assignee = m_at.group(1)
+                    task_text = task_text[:m_at.start()].strip()
+                ok, msg = _bt_add_task(
+                    project=proj["name"], task=task_text,
+                    source="手动添加", assignee=assignee,
+                    team_code=_current_team_code,
+                )
+                hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
                 if ok:
-                    try:
-                        pct = f"{float(current) / float(goal['target']) * 100:.0f}%"
-                    except (ValueError, ZeroDivisionError):
-                        pct = "-"
                     reply_card(mid, action_card(
-                        "🎯 目标已更新",
-                        f"**{goal['project']}** — {goal['name']}\n"
-                        f"进度：{current}/{goal['target']}{goal.get('unit','')}　({pct})",
+                        "✅ 任务已添加",
+                        f"**{proj['name']}** ← {task_text}"
+                        + (f"\n负责人：{assignee}" if assignee else ""),
+                        hints=[f"[打开项目管理中心]({hub_url})"] if hub_url else [],
                         color="green",
                     ))
                 else:
-                    reply_message(mid, msg)
-                return
+                    _log(f"添加任务失败: {msg}")
+                    reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
+            except Exception as e:
+                _log(f"加任务失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("添加任务失败", "操作失败，请稍后重试。"))
+            return
 
-            # ── 项目总览（仪表盘）──
-            if action == "project_dashboard":
-                proj_name = (params.get("project") or "").strip()
-                if not proj_name:
-                    reply_message(mid, "请说项目名称，例如：Q2营销 总览")
-                    return
-                try:
-                    headers, rows = project_dashboard(proj_name)
-                    lines = []
-                    lines.append("| 维度 | 指标 | 目标 | 当前 | 进度 | 状态 |")
-                    lines.append("|------|------|------|------|------|------|")
-                    for r in rows:
-                        lines.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
-                    from memo.bitable_hub import get_hub_url as _get_hub_url
-                    proj = find_project(proj_name)
-                    _hub = (proj.get("bitable_url") if proj else None) or _get_hub_url(team_code=_current_team_code)
-                    proj_link = f"\n\n[打开项目管理中心]({_hub})" if _hub else ""
+        # ── 导入飞书妙记 ──
+        if action == "import_minutes":
+            raw_text = params.get("text") or text
+            proj_name = (params.get("project") or "").strip()
+            token = extract_minute_token(raw_text)
+            if not token:
+                reply_message(mid, "没有识别到妙记链接，请发送完整的飞书妙记链接。")
+                return
+            ok, info = get_minutes_info(token)
+            if not ok:
+                _log(f"获取妙记失败: {info}")
+                reply_card(mid, error_card("获取妙记失败", "操作失败，请稍后重试。",
+                    suggestions=["检查链接是否正确", "确认 bot 有妙记阅读权限"]))
+                return
+            minutes_title = info.get("title", "未知会议")
+            minutes_dur = info.get("duration", "")
+            minutes_url = info.get("url", "")
+            if not proj_name:
+                projects = store_list_projects()
+                if projects:
+                    proj_hints = "、".join(p["name"] for p in projects[:5])
                     reply_card(mid, action_card(
-                        f"📊 {proj_name} 总览",
-                        "\n".join(lines) + proj_link,
-                        hints=["「记账 描述 金额 #项目」记一笔", f"「{proj_name} 设目标 xxx 数值」"],
-                        color="indigo",
+                        f"🎬 识别到妙记：{minutes_title}",
+                        f"时长：{minutes_dur}\n\n要归档到哪个项目？\n现有项目：{proj_hints}\n\n"
+                        f"回复：**归档到 项目名**",
+                        color="blue",
                     ))
-                except Exception as e:
-                    _log(f"项目总览失败: {e}\n{traceback.format_exc()}")
-                    reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
-                return
-
-            # ── 查日程 ──
-            if action == "get_schedule":
-                date_param = (params.get("date") or "today").strip()
-                agg = aggregate_for_date(date_param, user_open_id=user_open_id)
-                feishu = agg.get("feishu_events") or []
-                google_ev = agg.get("google_events") or []
-                memos = agg.get("memos") or []
-                lines = [f"【{agg['date']}】"]
-                if feishu:
-                    lines.append("飞书日程：")
-                    for e in feishu:
-                        s = e.get("summary") or "(无标题)"
-                        st = e.get("start") or {}
-                        ts = st.get("timestamp") if isinstance(st, dict) else ""
-                        lines.append(f"  - {s}" + (f" 时间戳:{ts}" if ts else ""))
-                if google_ev:
-                    lines.append("Google 日程：")
-                    for e in google_ev:
-                        lines.append(f"  - {e.get('summary', '')} {e.get('start', '')}～{e.get('end', '')}")
-                if memos:
-                    lines.append("备忘：")
-                    for m in memos:
-                        lines.append(f"  - {m.get('content', '')}")
-                if not feishu and not google_ev and not memos:
+                else:
                     reply_card(mid, action_card(
-                        f"📅 {agg['date']} 暂无安排",
-                        "今天是空白的一天，可以安心安排～",
-                        hints=["发「明天下午3点开会」加日程", "发「备忘 xxx」记事情"],
+                        f"🎬 识别到妙记：{minutes_title}",
+                        f"时长：{minutes_dur}\n\n还没有项目，先创建一个：\n**创建项目 项目名**",
+                        color="blue",
+                    ))
+                return
+            proj = find_project(proj_name)
+            if not proj:
+                reply_card(mid, error_card("未找到项目", f"没有「{proj_name}」",
+                    suggestions=[f"先「创建项目 {proj_name}」"]))
+                return
+            try:
+                from memo.bitable_hub import add_resource as _bt_add_resource, get_hub_url
+                note = f"时长：{minutes_dur}" if minutes_dur else ""
+                ok2, msg = _bt_add_resource(
+                    project=proj["name"],
+                    name=minutes_title,
+                    res_type="飞书妙记",
+                    link=minutes_url,
+                    source="自动记录",
+                    note=note,
+                    team_code=_current_team_code,
+                )
+                hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
+                if ok2:
+                    reply_card(mid, action_card(
+                        "✅ 妙记已归档到资料库",
+                        f"**{minutes_title}** → {proj['name']}\n\n"
+                        + (f"[打开项目管理中心]({hub_url})\n\n" if hub_url else "")
+                        + "粘贴会议纪要内容，我可以自动提取 action items",
+                        color="green",
+                    ))
+                else:
+                    _log(f"归档失败: {msg}")
+                    reply_card(mid, error_card("归档失败", "操作失败，请稍后重试。"))
+            except Exception as e:
+                _log(f"导入妙记失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("导入妙记失败", "操作失败，请稍后重试。"))
+            return
+
+        # ── 导入内容到项目（LLM 通用格式识别）──
+        if action == "import_content":
+            proj_name = (params.get("project") or "").strip()
+            content = (params.get("content") or text).strip()
+            if not proj_name:
+                projects = store_list_projects()
+                if projects:
+                    proj_hints = "、".join(p["name"] for p in projects[:5])
+                    reply_card(mid, action_card(
+                        "📋 导入到哪个项目？",
+                        f"现有项目：{proj_hints}\n\n回复：**导入到 项目名**",
+                        hints=["或先「创建项目 xxx」新建一个"],
+                        color="blue",
+                    ))
+                else:
+                    reply_message(mid, "还没有项目，先说「创建项目 xxx」新建一个。")
+                return
+            if not content or len(content) < 5:
+                reply_message(mid, "请粘贴要导入的内容（表格、列表、会议纪要、任意格式均可）。")
+                return
+            proj = find_project(proj_name)
+            if not proj:
+                reply_card(mid, error_card("未找到项目", f"没有「{proj_name}」",
+                    suggestions=[f"先「创建项目 {proj_name}」"]))
+                return
+            reply_card(mid, progress_card("正在识别内容", f"AI 解析中 → **{proj['name']}**", color="blue"))
+            try:
+                extract_prompt = (
+                    "从以下内容中提取所有任务/议题/事项。内容可能是：\n"
+                    "- Markdown 表格\n- 纯文本列表\n- 会议纪要\n- 项目计划\n- 任意格式\n\n"
+                    "每条输出一行 JSON：\n"
+                    "{\"task\": \"任务描述\", \"source\": \"来源说明(如:会议纪要/表格导入/项目计划)\", "
+                    "\"assignee\": \"负责人或空\", \"status\": \"待开始/进行中/已完成\", "
+                    "\"priority\": \"P0/P1/P2或空\", \"due\": \"截止日期或空\", \"note\": \"备注或空\"}\n\n"
+                    "要求：\n"
+                    "- 尽量保留原始信息，不要丢失字段\n"
+                    "- 如果原文有表头，根据表头映射字段\n"
+                    "- 如果是自由文本，提取其中的任务/决议/待办\n"
+                    "- 只输出 JSON 行，不要其他文字。没有任务就输出 []\n\n"
+                    f"内容：\n{content[:4000]}"
+                )
+                raw = chat(extract_prompt)
+                import json as _json
+                items = []
+                if raw and raw.strip().startswith("["):
+                    items = _json.loads(raw.strip())
+                else:
+                    for line in (raw or "").strip().split("\n"):
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                items.append(_json.loads(line))
+                            except _json.JSONDecodeError:
+                                pass
+                if not items:
+                    reply_card(mid, action_card(
+                        "📋 未识别到内容",
+                        "AI 没有从文本中提取到任务/事项。\n可以手动添加：\n"
+                        f"**{proj['name']} 加任务 xxx**",
                         color="blue",
                     ))
                     return
-                raw_text = "\n".join(lines)
-                from core.skill_router import enrich_prompt
-                system_prompt = enrich_prompt(
-                    "你是日程助手。根据下面汇总的日程与备忘，给用户一段简洁友好的总结与建议，控制在 200 字内。",
-                    user_text=raw_text, bot_type="assistant",
+                from memo.bitable_hub import add_task as _bt_add_task, get_hub_url
+                success_count = 0
+                for it in items:
+                    _ok, _ = _bt_add_task(
+                        project=proj["name"],
+                        task=it.get("task", ""),
+                        source=it.get("source", "导入"),
+                        assignee=it.get("assignee", ""),
+                        status=it.get("status", "待开始"),
+                        priority=it.get("priority", ""),
+                        due=it.get("due", ""),
+                        note=it.get("note", ""),
+                        team_code=_current_team_code,
+                    )
+                    if _ok:
+                        success_count += 1
+                hub_url = proj.get("bitable_url") or get_hub_url(team_code=_current_team_code)
+                if success_count > 0:
+                    preview = items[:10]
+                    task_list = "\n".join(
+                        f"- {it.get('task', '')}"
+                        + (f"（{it.get('assignee', '')}）" if it.get("assignee") else "")
+                        for it in preview
+                    )
+                    if len(items) > 10:
+                        task_list += f"\n- …还有 {len(items) - 10} 条"
+                    reply_card(mid, action_card(
+                        f"✅ 已导入 {success_count} 条到 {proj['name']}",
+                        task_list
+                        + (f"\n\n[打开项目管理中心]({hub_url})" if hub_url else ""),
+                        color="green",
+                    ))
+                else:
+                    _log("导入内容写入失败: 所有记录写入 Bitable 失败")
+                    reply_card(mid, error_card("写入失败", "操作失败，请稍后重试。"))
+            except Exception as e:
+                _log(f"导入内容失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("导入内容失败", "操作失败，请稍后重试。"))
+            return
+
+        # ── 记账（含项目标签提示）──
+        if action == "add_expense":
+            desc = (params.get("description") or "").strip()
+            amt_str = (params.get("amount") or "").strip()
+            exp_type = (params.get("type") or "支出").strip()
+            proj_tag = (params.get("project") or "").strip()
+            cat = (params.get("category") or "其他").strip()
+            if not desc or not amt_str:
+                reply_message(mid, "格式：记账 午餐 35\n或：支出 办公用品 200 #Q2营销")
+                return
+            try:
+                amt = float(amt_str)
+            except ValueError:
+                reply_message(mid, f"金额「{amt_str}」不是数字，请重新输入。")
+                return
+            if not proj_tag:
+                tags = available_project_tags()
+                if tags:
+                    tag_list = "　".join(f"`#{t}`" for t in tags[:8])
+                    _user_key = user_open_id or mid
+                    _set_pending(_user_key, "awaiting_expense_project",
+                                 description=desc, amount=amt, expense_type=exp_type,
+                                 category=cat)
+                    reply_card(mid, action_card(
+                        f"💰 {exp_type} ¥{amt:.0f} — {desc}",
+                        f"要归入哪个项目？\n{tag_list}\n\n"
+                        f"回复 **#项目名** 归入项目，或回复 **确认** 不归入项目直接记账。",
+                        color="blue",
+                    ))
+                    return
+            record = add_expense(
+                amount=amt, description=desc, category=cat,
+                expense_type=exp_type, project=proj_tag,
+                user_open_id=user_open_id or "",
+                team_code=_current_team_code,
+            )
+            tag_info = f"　#{proj_tag}" if proj_tag else ""
+            reply_card(mid, action_card(
+                f"✅ 已记账",
+                f"**{exp_type}** ¥{amt:,.2f} — {desc}{tag_info}\n日期：{record['date']}",
+                hints=["「本月花费」查看月度汇总", "「预算概览 项目名」查预算"],
+                color="green",
+            ))
+            return
+
+        # ── 批量记账（LLM 提取任意格式费用）──
+        if action == "import_expenses":
+            raw_content = (params.get("content") or text).strip()
+            proj_tag = (params.get("project") or "").strip()
+            if not raw_content or len(raw_content) < 5:
+                reply_message(mid, "请发送费用数据（表格、列表或任意格式），我会自动识别。")
+                return
+            reply_card(mid, progress_card("正在识别费用", "AI 解析中…", color="blue"))
+            try:
+                extract_prompt = (
+                    "从以下文本中提取所有费用/支出/收入记录。\n"
+                    "每条输出一行 JSON：{\"date\": \"YYYY-MM-DD或空\", \"category\": \"类别\", "
+                    "\"description\": \"描述\", \"amount\": 数字, \"type\": \"支出或收入\"}\n"
+                    "类别从以下选择：人力、营销、设计、技术、办公、差旅、餐饮、其他\n"
+                    "金额必须是纯数字。如果原文没有日期就留空。\n"
+                    "只输出 JSON 行，不要其他文字。如果没有费用数据就输出 []\n\n"
+                    f"文本：\n{raw_content[:4000]}"
                 )
-                try:
-                    reply_text = chat(raw_text, system_prompt=system_prompt) or raw_text
-                except Exception:
-                    reply_text = raw_text
+                raw = chat(extract_prompt)
+                import json as _json
+                items = []
+                if raw and raw.strip().startswith("["):
+                    items = _json.loads(raw.strip())
+                else:
+                    for line in (raw or "").strip().split("\n"):
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                items.append(_json.loads(line))
+                            except _json.JSONDecodeError:
+                                pass
+                if not items:
+                    reply_card(mid, action_card(
+                        "💰 未识别到费用",
+                        "AI 没有从内容中提取到费用记录。\n"
+                        "请确认内容包含金额信息，或尝试：**记账 描述 金额**",
+                        color="blue",
+                    ))
+                    return
+                records = []
+                for it in items:
+                    try:
+                        amt = float(it.get("amount", 0))
+                    except (ValueError, TypeError):
+                        continue
+                    if amt <= 0:
+                        continue
+                    r = add_expense(
+                        amount=amt,
+                        description=it.get("description", ""),
+                        category=it.get("category", "其他"),
+                        project=proj_tag or "",
+                        date=it.get("date", ""),
+                        expense_type=it.get("type", "支出"),
+                        user_open_id=user_open_id or "",
+                        team_code=_current_team_code,
+                    )
+                    records.append(r)
+                if not records:
+                    reply_message(mid, "提取到的记录金额均无效，请检查数据。")
+                    return
+                total = sum(r["amount"] for r in records)
+                detail_lines = []
+                for r in records[:15]:
+                    tag = f" #{r['project']}" if r.get("project") else ""
+                    detail_lines.append(f"- {r['type']} ¥{r['amount']:,.0f} {r['description']}{tag}")
+                if len(records) > 15:
+                    detail_lines.append(f"- …还有 {len(records) - 15} 条")
                 reply_card(mid, action_card(
-                    f"📅 {agg['date']} 日程概览",
-                    reply_text[:2000],
-                    hints=["发「明天」看明日安排", "发时间+事项可加日历"],
+                    f"✅ 已导入 {len(records)} 笔，共 ¥{total:,.2f}",
+                    "\n".join(detail_lines),
+                    hints=["「本月花费」查看月度汇总", "「预算概览 项目名」查预算"],
+                    color="green",
+                ))
+            except Exception as e:
+                _log(f"批量记账失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("导入费用失败", "操作失败，请稍后重试。"))
+            return
+
+        # ── 月度花费 ──
+        if action == "month_expenses":
+            month = (params.get("month") or "").strip()
+            try:
+                summary = month_summary(month)
+                if summary["count"] == 0:
+                    reply_card(mid, action_card(
+                        f"💰 {summary['month']} 暂无记录",
+                        "还没有记账数据。\n说 **记账 描述 金额** 开始记账。",
+                        color="blue",
+                    ))
+                    return
+                lines = [f"**{summary['month']}** 共 {summary['count']} 笔\n"]
+                lines.append(f"支出：**¥{summary['total_expense']:,.2f}**")
+                if summary["total_income"] > 0:
+                    lines.append(f"收入：¥{summary['total_income']:,.2f}")
+                if summary["by_category"]:
+                    lines.append("\n**按类别：**")
+                    for cat, val in summary["by_category"].items():
+                        lines.append(f"- {cat}　¥{val:,.0f}")
+                if summary["by_project"]:
+                    lines.append("\n**按项目：**")
+                    for proj, val in summary["by_project"].items():
+                        lines.append(f"- {proj}　¥{val:,.0f}")
+                from memo.bitable_hub import get_hub_url as _get_hub_url
+                _hub = _get_hub_url(team_code=_current_team_code)
+                if _hub:
+                    lines.append(f"\n[打开项目管理中心]({_hub})")
+                reply_card(mid, action_card(
+                    f"💰 {summary['month']} 月度花费",
+                    "\n".join(lines),
+                    hints=["「预算概览 项目名」看预算执行", "「项目名 总览」看全维度"],
+                    color="blue",
+                ))
+            except Exception as e:
+                _log(f"月度花费失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
+            return
+
+        # ── 创建预算 ──
+        if action == "create_budget":
+            proj_name = (params.get("project") or "").strip()
+            if not proj_name:
+                reply_message(mid, "请说项目名称，例如：创建预算 Q2营销")
+                return
+            existing = find_budget(proj_name)
+            if existing:
+                reply_card(mid, action_card(
+                    "💰 预算已存在",
+                    f"**{existing['project']}** 总预算 ¥{existing['total_budget']:,.0f}",
+                    hints=[f"「{proj_name} 预算」查看详情", f"「{proj_name} 总览」看全维度"],
                     color="blue",
                 ))
                 return
+            _user_key = user_open_id or mid
+            _set_pending(_user_key, "awaiting_budget_items", project=proj_name)
+            reply_card(mid, action_card(
+                f"💰 创建预算 — {proj_name}",
+                "请发送预算项（每行一项），格式：\n"
+                "> 类别 金额\n\n"
+                "例如：\n"
+                "> 营销 50000\n"
+                "> 设计 10000\n"
+                "> 差旅 5000\n\n"
+                "发「取消」跳过。",
+                color="blue",
+            ))
+            return
 
-            # ── 翻译/写英文：优先拦截，不使用意图解析的 reply ──
-            _lower_for_translate = text.lower().strip()
-            _is_translate = any(
-                kw in _lower_for_translate for kw in ("翻译成英文", "帮我翻译", "译成英文", "写英文消息", "帮我写英文", "翻译：", "翻译:")
-            )
-            if _is_translate:
-                _translate_sys = (
-                    "你只做一件事：把用户给的中文内容翻译成英文并输出。\n"
-                    "禁止：说「好的」、说「我来帮你」、加任何中文。\n"
-                    "只输出英文译文，从第一个英文字母开始。"
-                )
-                _content = text
-                for _sep in ("：", ":", "\n"):
-                    if _sep in _content:
-                        _parts = _content.split(_sep, 1)
-                        if len(_parts) == 2 and _parts[0].strip() and any(k in _parts[0] for k in ("翻译", "英文", "写")):
-                            _content = _parts[1].strip()
-                            break
-                try:
-                    reply_text = chat(f"将以下中文翻译成英文，直接输出英文：\n\n{_content}", system_prompt=_translate_sys) or "（翻译失败）"
-                except Exception as e:
-                    _log(f"翻译 LLM 异常: {e}")
-                    reply_text = "（翻译暂时不可用，请稍后再试）"
-                _log(f"翻译回复 长度={len(reply_text)} 预览={reply_text[:80]!r}")
-                reply_message(mid, reply_text[:2000])
+        # ── 预算概览 ──
+        if action == "budget_overview":
+            proj_name = (params.get("project") or "").strip()
+            if not proj_name:
+                reply_message(mid, "请说项目名称，例如：预算概览 Q2营销")
                 return
-
-            # ── 普通聊天（AgentLoop + 工具）──
-            reply_text = _smart_chat(text, user_open_id or "")
-            _log(f"回复用户消息(聊天) 长度={len(reply_text)} 预览={reply_text[:80]!r}...")
-            r = reply_message(mid, reply_text[:2000])
-            if r and r.get("code") != 0:
-                _log(f"回复消息失败: code={r.get('code')} msg={r.get('msg')}")
-
-        except Exception as e:
-            _log(f"处理异常: {e}\n{traceback.format_exc()}")
             try:
-                reply_card(mid, error_card("处理出错", "内部错误，请稍后重试", suggestions=["重新发送试试", "发「帮助」看指令"]))
-            except Exception:
-                pass
+                headers, rows, summary = budget_vs_actual(proj_name)
+                if "error" in summary:
+                    reply_card(mid, error_card("预算概览", summary["error"],
+                        suggestions=[f"先「创建预算 {proj_name}」"]))
+                    return
+                lines = [
+                    f"总预算：**¥{summary['total_budget']:,.0f}**\n"
+                    f"已花费：**¥{summary['total_actual']:,.0f}**\n"
+                    f"剩余：¥{summary['total_remaining']:,.0f}　使用率 {summary['usage_pct']}\n"
+                ]
+                lines.append("| 预算项 | 预算 | 实际 | 剩余 | 使用率 |")
+                lines.append("|--------|------|------|------|--------|")
+                for r in rows:
+                    lines.append(f"| {r[0]} | ¥{r[2]} | ¥{r[3]} | ¥{r[4]} | {r[5]} |")
+                reply_card(mid, action_card(
+                    f"💰 {proj_name} 预算概览",
+                    "\n".join(lines),
+                    hints=[f"「{proj_name} 总览」看全维度", "「本月花费」看月度汇总"],
+                    color="blue",
+                ))
+            except Exception as e:
+                _log(f"预算概览失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
+            return
 
-    threading.Thread(target=_process, args=(message_id, user_text, open_id), daemon=True).start()
+        # ── 设目标 ──
+        if action == "add_goal":
+            proj_name = (params.get("project") or "").strip()
+            goal_name = (params.get("name") or "").strip()
+            target = (params.get("target") or "").strip()
+            unit = (params.get("unit") or "").strip()
+            if not proj_name or not goal_name or not target:
+                reply_message(mid, "格式：Q2营销 设目标 新增用户 10000 人")
+                return
+            goal = add_goal(proj_name, goal_name, target, unit, team_code=_current_team_code)
+            reply_card(mid, action_card(
+                "🎯 目标已设定",
+                f"**{proj_name}**\n{goal_name}：{target}{unit}\n\n"
+                f"说 **更新目标 {goal_name} 当前值** 更新进度",
+                hints=[f"「{proj_name} 总览」看全维度仪表盘"],
+                color="green",
+            ))
+            return
+
+        # ── 更新目标 ──
+        if action == "update_goal":
+            kw = (params.get("keyword") or "").strip()
+            current = (params.get("current") or "").strip()
+            if not kw or not current:
+                reply_message(mid, "格式：更新目标 新增用户 7500")
+                return
+            goal = find_goal_by_keyword(kw)
+            if not goal:
+                reply_message(mid, f"没找到包含「{kw}」的目标。")
+                return
+            ok, msg = update_goal(goal["id"], current=current)
+            if ok:
+                try:
+                    pct = f"{float(current) / float(goal['target']) * 100:.0f}%"
+                except (ValueError, ZeroDivisionError):
+                    pct = "-"
+                reply_card(mid, action_card(
+                    "🎯 目标已更新",
+                    f"**{goal['project']}** — {goal['name']}\n"
+                    f"进度：{current}/{goal['target']}{goal.get('unit','')}　({pct})",
+                    color="green",
+                ))
+            else:
+                reply_message(mid, msg)
+            return
+
+        # ── 项目总览（仪表盘）──
+        if action == "project_dashboard":
+            proj_name = (params.get("project") or "").strip()
+            if not proj_name:
+                reply_message(mid, "请说项目名称，例如：Q2营销 总览")
+                return
+            try:
+                headers, rows = project_dashboard(proj_name)
+                lines = []
+                lines.append("| 维度 | 指标 | 目标 | 当前 | 进度 | 状态 |")
+                lines.append("|------|------|------|------|------|------|")
+                for r in rows:
+                    lines.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+                from memo.bitable_hub import get_hub_url as _get_hub_url
+                proj = find_project(proj_name)
+                _hub = (proj.get("bitable_url") if proj else None) or _get_hub_url(team_code=_current_team_code)
+                proj_link = f"\n\n[打开项目管理中心]({_hub})" if _hub else ""
+                reply_card(mid, action_card(
+                    f"📊 {proj_name} 总览",
+                    "\n".join(lines) + proj_link,
+                    hints=["「记账 描述 金额 #项目」记一笔", f"「{proj_name} 设目标 xxx 数值」"],
+                    color="indigo",
+                ))
+            except Exception as e:
+                _log(f"项目总览失败: {e}\n{traceback.format_exc()}")
+                reply_card(mid, error_card("查询失败", "查询失败，请稍后重试。"))
+            return
+
+        # ── 查日程 ──
+        if action == "get_schedule":
+            date_param = (params.get("date") or "today").strip()
+            agg = aggregate_for_date(date_param, user_open_id=user_open_id)
+            feishu = agg.get("feishu_events") or []
+            google_ev = agg.get("google_events") or []
+            memos = agg.get("memos") or []
+            lines = [f"【{agg['date']}】"]
+            if feishu:
+                lines.append("飞书日程：")
+                for e in feishu:
+                    s = e.get("summary") or "(无标题)"
+                    st = e.get("start") or {}
+                    ts = st.get("timestamp") if isinstance(st, dict) else ""
+                    lines.append(f"  - {s}" + (f" 时间戳:{ts}" if ts else ""))
+            if google_ev:
+                lines.append("Google 日程：")
+                for e in google_ev:
+                    lines.append(f"  - {e.get('summary', '')} {e.get('start', '')}～{e.get('end', '')}")
+            if memos:
+                lines.append("备忘：")
+                for m in memos:
+                    lines.append(f"  - {m.get('content', '')}")
+            if not feishu and not google_ev and not memos:
+                reply_card(mid, action_card(
+                    f"📅 {agg['date']} 暂无安排",
+                    "今天是空白的一天，可以安心安排～",
+                    hints=["发「明天下午3点开会」加日程", "发「备忘 xxx」记事情"],
+                    color="blue",
+                ))
+                return
+            raw_text = "\n".join(lines)
+            from core.skill_router import enrich_prompt
+            system_prompt = enrich_prompt(
+                "你是日程助手。根据下面汇总的日程与备忘，给用户一段简洁友好的总结与建议，控制在 200 字内。",
+                user_text=raw_text, bot_type="assistant",
+            )
+            try:
+                reply_text = chat(raw_text, system_prompt=system_prompt) or raw_text
+            except Exception:
+                reply_text = raw_text
+            reply_card(mid, action_card(
+                f"📅 {agg['date']} 日程概览",
+                reply_text[:2000],
+                hints=["发「明天」看明日安排", "发时间+事项可加日历"],
+                color="blue",
+            ))
+            return
+
+        # ── 翻译/写英文：优先拦截，不使用意图解析的 reply ──
+        _lower_for_translate = text.lower().strip()
+        _is_translate = any(
+            kw in _lower_for_translate for kw in ("翻译成英文", "帮我翻译", "译成英文", "写英文消息", "帮我写英文", "翻译：", "翻译:")
+        )
+        if _is_translate:
+            _translate_sys = (
+                "你只做一件事：把用户给的中文内容翻译成英文并输出。\n"
+                "禁止：说「好的」、说「我来帮你」、加任何中文。\n"
+                "只输出英文译文，从第一个英文字母开始。"
+            )
+            _content = text
+            for _sep in ("：", ":", "\n"):
+                if _sep in _content:
+                    _parts = _content.split(_sep, 1)
+                    if len(_parts) == 2 and _parts[0].strip() and any(k in _parts[0] for k in ("翻译", "英文", "写")):
+                        _content = _parts[1].strip()
+                        break
+            try:
+                reply_text = chat(f"将以下中文翻译成英文，直接输出英文：\n\n{_content}", system_prompt=_translate_sys) or "（翻译失败）"
+            except Exception as e:
+                _log(f"翻译 LLM 异常: {e}")
+                reply_text = "（翻译暂时不可用，请稍后再试）"
+            _log(f"翻译回复 长度={len(reply_text)} 预览={reply_text[:80]!r}")
+            reply_message(mid, reply_text[:2000])
+            return
+
+        # ── 普通聊天（AgentLoop + 工具）──
+        reply_text = _smart_chat(text, user_open_id or "")
+        _log(f"回复用户消息(聊天) 长度={len(reply_text)} 预览={reply_text[:80]!r}...")
+        r = reply_message(mid, reply_text[:2000])
+        if r and r.get("code") != 0:
+            _log(f"回复消息失败: code={r.get('code')} msg={r.get('msg')}")
+
+    except Exception as e:
+        _log(f"处理异常: {e}\n{traceback.format_exc()}")
+        try:
+            reply_card(mid, error_card("处理出错", "内部错误，请稍后重试", suggestions=["重新发送试试", "发「帮助」看指令"]))
+        except Exception:
+            pass
 
 
 def _handle_bot_p2p_chat_entered(data) -> None:
