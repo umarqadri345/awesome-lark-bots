@@ -396,6 +396,51 @@ def mark_board_record_done(memo_id: str) -> bool:
     return False
 
 
+def list_active_board_records(thread: Optional[str] = None) -> List[Dict[str, Any]]:
+    """从 Bitable 看板读取未完成的记录（以看板为唯一真相源）。
+
+    返回状态不为「已完成」的记录列表，格式兼容 store.list_memos() 的输出。
+    可选按线程筛选。
+    """
+    from core.feishu_client import list_bitable_records
+
+    app, tid = _get_ids()
+    if not app or not tid:
+        return []
+
+    ok, records = list_bitable_records(app, tid)
+    if not ok or not records:
+        return []
+
+    result = []
+    for rec in records:
+        f = rec.get("fields") or {}
+        status = f.get("状态", "")
+        if status == "已完成":
+            continue
+
+        rec_thread = f.get("线程", "") or ""
+        if thread and rec_thread != thread:
+            continue
+
+        result.append({
+            "id": f.get("memo_id", ""),
+            "content": f.get("内容", ""),
+            "thread": rec_thread,
+            "assignee": (f.get("执行者", "") or "").lower(),
+            "done": False,
+            "created_at": f.get("创建时间", ""),
+            "status": status,
+            "claude_note": f.get("Claude备注", ""),
+            "partner_feedback": f.get("搭档反馈", ""),
+            "record_id": rec.get("record_id", ""),
+        })
+
+    # 按创建时间降序
+    result.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return result
+
+
 def delete_board_record(memo_id: str) -> bool:
     """按 memo_id 删除看板中对应记录。"""
     if not memo_id:

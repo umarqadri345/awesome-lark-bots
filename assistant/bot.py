@@ -59,6 +59,7 @@ from memo.bitable_board import (
     refresh_board as bitable_refresh_board,
     append_board_record as bitable_append_record,
     get_board_url as get_bitable_board_url,
+    list_active_board_records,
 )
 from memo.projects import (
     register_project, list_projects as store_list_projects,
@@ -193,11 +194,8 @@ def _parse_memo_content_and_category(text: str) -> tuple[str, Optional[str]]:
 def _auto_append_board(thread: str, content: str, status: str = "⬜ 进行中", assignee: str = "", memo_id: str = ""):
     """备忘添加后自动追加到备忘看板 Bitable（静默失败）。
 
-    v2: 有 thread 或 assignee 就写入看板（不再跳过无线程的备忘，
-        只要有 @claude 标记就一定同步）。带 memo_id 以支持后续 upsert。
+    v3: 所有备忘都写入看板，以看板为唯一真相源。
     """
-    if not thread and not assignee:
-        return
     try:
         from datetime import datetime as _dt
         created = _dt.utcnow().strftime("%Y-%m-%d")
@@ -1088,10 +1086,14 @@ def _process_message(mid: str, text: str, user_open_id: Optional[str]):
 
         if action == "list_memos":
             thread_filter = params.get("thread", "")
-            memos = store_list_memos(
-                limit=50, user_open_id=user_open_id,
-                thread=thread_filter or None, include_done=False,
-            )
+            # 优先从 Bitable 看板读取（以看板为准）
+            memos = list_active_board_records(thread=thread_filter or None)
+            if not memos:
+                # 看板查询失败或为空时回退到本地
+                memos = store_list_memos(
+                    limit=50, user_open_id=user_open_id,
+                    thread=thread_filter or None, include_done=False,
+                )
             if not memos:
                 reply_card(mid, action_card("📋 暂无未完成的备忘", hints=["发「备忘 内容」开始记"], color="blue"))
                 return
@@ -1109,12 +1111,15 @@ def _process_message(mid: str, text: str, user_open_id: Optional[str]):
             return
 
         if action == "list_tasks":
-            memos = store_list_memos(limit=10, user_open_id=user_open_id)
+            # 优先从 Bitable 看板读取（以看板为准）
+            memos = list_active_board_records()
+            if not memos:
+                memos = store_list_memos(limit=10, user_open_id=user_open_id)
             if not memos:
                 reply_message(mid, "暂无未完成的备忘。")
                 return
             lines = ["未完成备忘（「完成 序号」标记完成）："]
-            for i, m in enumerate(memos, 1):
+            for i, m in enumerate(memos[:10], 1):
                 thread = m.get("thread") or ""
                 tag = f"[#{thread}] " if thread else ""
                 lines.append(f"{i}. {tag}{m.get('content', '')}")
@@ -1230,7 +1235,10 @@ def _process_message(mid: str, text: str, user_open_id: Optional[str]):
             if not thread_name:
                 reply_message(mid, "请说线程名，例如「#creator进展」。")
                 return
-            memos = store_list_memos(thread=thread_name, user_open_id=user_open_id, limit=10)
+            # 优先从 Bitable 看板读取
+            memos = list_active_board_records(thread=thread_name)
+            if not memos:
+                memos = store_list_memos(thread=thread_name, user_open_id=user_open_id, limit=10)
             if not memos:
                 reply_message(mid, f"#{thread_name} 暂无备忘。")
                 return

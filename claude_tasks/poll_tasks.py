@@ -185,7 +185,17 @@ def scan_board(skip_noted: bool = True) -> dict:
         else:
             other_tasks.append(task)
 
-    return {"claude_tasks": claude_tasks, "other_tasks": other_tasks}
+    # 单独提取有搭档反馈的任务（最高优先级）
+    feedback_tasks = [
+        t for t in claude_tasks + other_tasks
+        if t.get("partner_feedback", "").strip()
+    ]
+
+    return {
+        "feedback_tasks": feedback_tasks,
+        "claude_tasks": claude_tasks,
+        "other_tasks": other_tasks,
+    }
 
 
 def poll_feedback() -> list[dict]:
